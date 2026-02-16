@@ -21,6 +21,18 @@ use crate::driver::plugin::DriverPlugin;
 use crate::persistence::{AcquireItem, LoadStatus, TaskStore};
 use crate::policy::WaitStrategy;
 
+/// 许可守卫 (PermitGuard) - 用于批量占座的 RAII 结构体
+struct PermitGuard {
+    semaphore: Arc<Semaphore>,
+    permits: u32,
+}
+/// 释放许可时自动归还给信号量
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        self.semaphore.add_permits(self.permits as usize);
+    }
+}
+
 struct RunningTaskHandle {
     epoch: u64,
     token: CancellationToken,
@@ -155,7 +167,8 @@ where
             &self.inner.ctx.shutdown,
             self.inner.wait_strategy.clone(),
         );
-
+        let semaphore = &self.inner.semaphore;
+        let batch_size_cfg = self.inner.ctx.config.cluster.acquire_batch_size;
         loop {
             // 等待信号 (Wait)
             match pacemaker.wait_next().await {
@@ -174,9 +187,13 @@ where
                 pacemaker.mark_idle();
                 continue;
             }
-
+            // =========================================================
             // 并发控制
+            // =========================================================
+
+            // 检查余量
             let available = self.inner.semaphore.available_permits();
+            // 如果当前完全没空位，不要忙轮询，而是挂起等待至少 1 个空位释放。
             if available == 0 {
                 match tokio::time::timeout(Duration::from_secs(1), self.inner.semaphore.acquire())
                     .await
@@ -184,8 +201,6 @@ where
                     Ok(Ok(permit)) => {
                         // 等到了空位！立即释放
                         drop(permit);
-                        // 标记为 busy
-                        pacemaker.mark_busy();
                     }
                     _ => {
                         // 等了 1秒 还没空位，或者获取失败
@@ -196,11 +211,24 @@ where
                 continue;
             }
 
-            // 批量拉取
-            // 计算本次拉取数量：取 配置Batch 和 剩余空位 的最小值。
-            // 防止：还剩 1 个空位，却拉了 50 个任务，导致 49 个任务瞬间堆积排队。
-            let batch_size = self.inner.ctx.config.cluster.acquire_batch_size;
-            let ask_size = (batch_size as usize).min(available);
+            // 计算本次最大能拉多少 (不超过 Batch，也不超过 Available)
+            // 注意：再次获取 available，因为刚才可能变了
+            let current_available = semaphore.available_permits();
+            // 防止 acquire_many 报错（不能申请 0 个）
+            if current_available == 0 {
+                continue;
+            }
+            let ask_size = batch_size_cfg.min(current_available);
+
+            // 批量占座 (Bulk Acquire)
+            // 一次原子操作拿走所有需要的票。
+            let bulk_permit = match semaphore.clone().acquire_many_owned(ask_size as u32).await {
+                Ok(p) => p,
+                Err(_) => break, // 信号量被关闭
+            };
+            // =========================================================
+            // 执行拉取 (Fetch)
+            // =========================================================
 
             // 调用持久化层 (Queue) 拉取任务
             match self
@@ -211,30 +239,39 @@ where
                 .await
             {
                 Ok(items) => {
-                    // 没任务了 (Empty Queue)
-                    if items.is_empty() {
+                    let fetched_count = items.len();
+
+                    // 没有拉到任务，可能是暂时没有到期的任务了，或者竞争太激烈了。
+                    if fetched_count == 0 {
                         pacemaker.mark_idle();
                         continue;
                     }
                     // 拉到了任务 -> 标记忙碌 (重置退避时间为 0)
                     pacemaker.mark_busy();
+                    // 禁止自动释放许可，因为我们要把它们分发给具体的任务了。
+                    bulk_permit.forget();
+
+                    // 实际拿到的任务数量可能少于 ask_size，释放多余的许可
+                    if fetched_count < ask_size {
+                        semaphore.add_permits(ask_size - fetched_count);
+                    }
 
                     // 任务分发 (Spawn)
                     for item in items {
-                        match self.inner.semaphore.clone().acquire_owned().await {
-                            Ok(permit) => {
-                                // 成功获取门票，启动子协程(实际是同步任务)
-                                self.spawn_task(item, permit).await;
-                            }
-                            Err(_) => {}
-                        }
+                        let guard = PermitGuard {
+                            semaphore: semaphore.clone(),
+                            permits: 1,
+                        };
+                        self.spawn_task(item, guard).await;
                     }
                 }
                 Err(e) => {
                     error!("[Driver] Acquire failed: {:?}", e);
                     // 遇到错误必须退避，防止错误风暴
                     pacemaker.mark_idle();
-                    // 额外强制睡一会，保护存储层
+                    // bulk_permit 自动 Drop，全额退票 -> 正确
+
+                    // 保护性休眠
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
@@ -242,7 +279,7 @@ where
     }
 
     /// 任务分发
-    async fn spawn_task(&self, item: AcquireItem, permit: OwnedSemaphorePermit) {
+    async fn spawn_task(&self, item: AcquireItem, permit: PermitGuard) {
         let driver = self.clone();
 
         let token = CancellationToken::new();
@@ -254,7 +291,9 @@ where
             },
         );
         tokio::spawn(async move {
-            // 在这里完成失效
+            // 所有权转移：PermitGuard 移动到了这个 Future 内部。
+            // 无论 execute_task 是成功、失败还是 Panic，
+            // 只要这个 async 块结束，permit 就会被 Drop，从而归还信号量。
             let _guard = permit;
             driver.execute_task(item.id, item.score, token).await;
         });
