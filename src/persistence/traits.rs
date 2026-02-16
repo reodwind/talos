@@ -1,5 +1,6 @@
 use crate::common::TaskData;
 use crate::common::error::Result;
+use crate::persistence::{AcquireItem, LoadStatus};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -110,13 +111,13 @@ pub trait TaskStore<T>: Send + Sync + 'static {
     /// 加载任务 (Load)
     ///
     /// 根据 ID 获取任务的完整上下文。
-    async fn load(&self, id: &str) -> Result<Option<TaskData<T>>>;
+    async fn load(&self, id: &str) -> Result<LoadStatus<T>>;
 
     /// 批量加载任务 (Load Batch)
     ///
     /// **性能关键点**: 在 `acquire` 拿到一批 ID 后，通过此接口一次性加载数据。
     /// 避免 N+1 次网络调用。
-    async fn load_batch(&self, ids: &[String]) -> Result<Vec<Option<TaskData<T>>>>;
+    async fn load_batch(&self, ids: &[String]) -> Result<Vec<LoadStatus<T>>>;
 
     /// 移除任务 (Remove)
     ///
@@ -138,12 +139,4 @@ pub trait TaskStore<T>: Send + Sync + 'static {
     /// - `ctx`: 任务上下文。
     /// - `err_msg`: 失败原因描述。
     async fn move_to_dlq(&self, ctx: &TaskData<T>, err_msg: String) -> Result<()>;
-}
-
-/// acquire 拉取结果
-#[derive(Debug, Clone)]
-pub struct AcquireItem {
-    pub id: String,
-    /// ZSet 中的 Score，通常作为 Epoch 或 执行时间戳
-    pub score: u64,
 }

@@ -1,6 +1,7 @@
 use super::MemoryPersistence;
 use crate::common::error::Result;
 use crate::common::model::{TaskData, TaskState};
+use crate::persistence::LoadStatus;
 use crate::persistence::traits::TaskStore;
 use async_trait::async_trait;
 
@@ -28,20 +29,20 @@ where
         Ok(())
     }
 
-    async fn load(&self, id: &str) -> Result<Option<TaskData<T>>> {
+    async fn load(&self, id: &str) -> Result<LoadStatus<T>> {
         match self.data.get(id) {
-            Some(v) => Ok(Some(v.clone())),
-            None => Ok(None),
+            Some(v) => Ok(LoadStatus::Found(v.clone())),
+            None => Ok(LoadStatus::NotFound),
         }
     }
 
-    async fn load_batch(&self, ids: &[String]) -> Result<Vec<Option<TaskData<T>>>> {
+    async fn load_batch(&self, ids: &[String]) -> Result<Vec<LoadStatus<T>>> {
         let mut results = Vec::with_capacity(ids.len());
         // 内存操作极快，直接循环获取即可
         for id in ids {
             match self.data.get(id) {
-                Some(task) => results.push(Some(task.clone())),
-                None => {}
+                Some(task) => results.push(LoadStatus::Found(task.clone())),
+                None => results.push(LoadStatus::NotFound),
             }
         }
         Ok(results)

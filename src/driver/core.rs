@@ -18,7 +18,7 @@ use crate::driver::PacemakerEvent;
 use crate::driver::context::DriverContext;
 use crate::driver::pacemaker::TaskPacemaker;
 use crate::driver::plugin::DriverPlugin;
-use crate::persistence::{AcquireItem, TaskStore};
+use crate::persistence::{AcquireItem, LoadStatus, TaskStore};
 use crate::policy::WaitStrategy;
 
 struct RunningTaskHandle {
@@ -268,11 +268,26 @@ where
     async fn execute_task(&self, task_id: String, epoch: u64, token: CancellationToken) {
         let store = &self.inner.ctx.store;
         let mut task_data = match store.load(&task_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
+            // 1. 正常路径
+            Ok(LoadStatus::Found(c)) => c,
+            // 2.  数据损坏
+            Ok(LoadStatus::DataCorrupted {
+                reason: _,
+                raw_content: _,
+            }) => {
+                // 必须彻底删除该任务，否则 Rescuer 会无限复活它
+                store.remove(&task_id).await.ok();
                 self.inner.running_tasks.remove(&task_id);
                 return;
             }
+            // 3. 幽灵路径 (Orphan): 索引还在，数据没了
+            Ok(LoadStatus::NotFound) => {
+                // 彻底清理
+                let _ = store.remove(&task_id).await;
+                self.inner.running_tasks.remove(&task_id);
+                return;
+            }
+            // 4. 系统故障: Redis 连不上等
             Err(e) => {
                 error!("[Driver] Load task {} failed: {:?}", task_id, e);
                 self.inner.running_tasks.remove(&task_id);

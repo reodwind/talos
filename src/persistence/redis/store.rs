@@ -4,6 +4,7 @@ use super::core::RedisPersistence;
 use crate::common::TimeUtils;
 use crate::common::error::Result;
 use crate::common::model::{TaskData, TaskState};
+use crate::persistence::LoadStatus;
 use crate::persistence::traits::TaskStore;
 use deadpool_redis::redis::{self, AsyncCommands};
 
@@ -43,7 +44,7 @@ where
         Ok(())
     }
 
-    async fn load(&self, id: &str) -> Result<Option<TaskData<T>>> {
+    async fn load(&self, id: &str) -> Result<LoadStatus<T>> {
         let mut conn = self.pool.get().await?;
         let key = self.key_data(id);
 
@@ -51,15 +52,18 @@ where
         let json: Option<String> = conn.get(key).await?;
 
         match json {
-            Some(s) => {
-                let ctx = serde_json::from_str(&s)?;
-                Ok(Some(ctx))
-            }
-            None => Ok(None),
+            Some(s) => match serde_json::from_str::<TaskData<T>>(&s) {
+                Ok(ctx) => Ok(LoadStatus::Found(ctx)),
+                Err(e) => Ok(LoadStatus::DataCorrupted {
+                    reason: e.to_string(),
+                    raw_content: s.clone(),
+                }),
+            },
+            None => Ok(LoadStatus::NotFound),
         }
     }
 
-    async fn load_batch(&self, ids: &[String]) -> Result<Vec<Option<TaskData<T>>>> {
+    async fn load_batch(&self, ids: &[String]) -> Result<Vec<LoadStatus<T>>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
@@ -73,11 +77,14 @@ where
         let mut results = Vec::with_capacity(ids.len());
         for json_opt in json_list {
             match json_opt {
-                Some(s) => {
-                    let ctx = serde_json::from_str(&s)?;
-                    results.push(Some(ctx));
-                }
-                None => results.push(None),
+                Some(s) => match serde_json::from_str::<TaskData<T>>(&s) {
+                    Ok(ctx) => results.push(LoadStatus::Found(ctx)),
+                    Err(e) => results.push(LoadStatus::DataCorrupted {
+                        reason: e.to_string(),
+                        raw_content: s.clone(),
+                    }),
+                },
+                None => results.push(LoadStatus::NotFound),
             }
         }
         Ok(results)
