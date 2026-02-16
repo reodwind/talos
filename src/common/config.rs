@@ -165,6 +165,12 @@ pub struct PolicyConfig {
     /// - 建议: 设为 `heartbeat_interval_ms` 的 3~5 倍。
     pub zombie_check_interval_ms: u64,
 
+    /// 每次回收僵尸任务的最大数量
+    ///
+    /// - 默认: 50
+    /// - 建议: 根据 Redis 负载调整，避免单次操作阻塞太久。
+    pub rescue_batch_size: usize,
+
     /// 僵尸任务最大抢占次数 (熔断阈值)
     ///
     /// - 说明: 一个任务因超时被抢救(Reschedule)的最大次数。超过此值将被移入死信队列(DLQ)。
@@ -186,6 +192,7 @@ impl Default for PolicyConfig {
             execution_mode: ExecutionMode::WorkerPool,
             callback_mode: CallbackMode::Sync,
             zombie_check_interval_ms: 30_000,
+            rescue_batch_size: 50,
             max_zombie_retries: 3,
             submit_timeout_ms: 2000,
             shutdown_timeout_secs: 30,

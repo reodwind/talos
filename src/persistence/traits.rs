@@ -69,6 +69,23 @@ pub trait TaskQueue: Send + Sync + 'static {
     /// # 参数
     /// - `notify`: Tokio 的通知句柄。实现层应在后台监听（如 Redis Subscribe），收到消息后调用 `notify.notify_one()`。
     async fn watch(&self, notify: Arc<Notify>) -> Result<()>;
+
+    /// 回收僵尸任务 (Rescue)
+    ///
+    /// 找出并重置那些“疑似已死”的任务。
+    ///
+    /// # 参数
+    /// - `worker_id`: 当前节点的 ID (用于日志或抢占标记)。
+    /// - `now`: 当前统一时间戳 (秒/毫秒，取决于实现)。
+    /// - `timeout_ms`: 任务超时阈值 (配置中的 visibility_timeout_ms 或 zombie_check_interval_ms)。
+    /// - `limit`: 本次回收最大数量，避免单次操作过重。
+    async fn rescue(
+        &self,
+        worker_id: &str,
+        now: f64,
+        timeout_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<String>>;
 }
 
 // ==========================================

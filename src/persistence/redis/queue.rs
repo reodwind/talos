@@ -101,7 +101,33 @@ impl TaskQueue for RedisPersistence {
 
         Ok(())
     }
+    async fn rescue(
+        &self,
+        _worker_id: &str,
+        now: f64,
+        timeout_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.pool.get().await?;
 
+        // 安全计算阈值：threshold = now - timeout
+        let timeout_secs = timeout_ms as f64 / 1000.0;
+        let threshold = now - timeout_secs;
+
+        let result: Vec<String> = self
+            .scripts
+            .rescue
+            .key(self.key_pending())
+            .key(self.key_running())
+            .arg(threshold) // ARGV[1]
+            .arg(now) // ARGV[2]
+            .arg(limit) // ARGV[3]
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(result)
+    }
+    
     async fn release(&self, task_ids: &[String], _worker_id: &str) -> Result<()> {
         let mut conn = self.pool.get().await?;
         let mut pipe = redis::pipe();

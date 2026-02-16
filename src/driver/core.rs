@@ -111,6 +111,13 @@ where
             heartbeat_driver.heartbeat_loop().await;
         });
 
+        // 1.1. 启动僵尸任务回收协程 (Rescue Loop)
+        // 设计原则：与 Heartbeat 保持一致，独立后台 Loop
+        let rescue_driver = self.clone();
+        tokio::spawn(async move {
+            rescue_driver.rescue_loop().await;
+        });
+
         // 2. 启动拉取主循环 (阻塞直到 shutdown)
         let fetcher_count = self.inner.ctx.config.worker.workers.max(1);
         trace!("[Driver] Spawning {} fetch loops.", fetcher_count);
@@ -442,6 +449,43 @@ where
                     // 可选：防止日志刷屏
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+            }
+        }
+    }
+    /// 僵尸任务回收循环
+    async fn rescue_loop(&self) {
+        let config = &self.inner.ctx.config.policy;
+        let interval = Duration::from_millis(config.zombie_check_interval_ms);
+
+        if config.zombie_check_interval_ms == 0 {
+            return;
+        }
+
+        loop {
+            sleep(interval).await;
+            if self.inner.ctx.is_shutdown() {
+                break;
+            }
+
+            // 获取统一时间
+            let now = TimeUtils::now();
+            let timeout_ms = config.zombie_check_interval_ms; // 或者 visibility_timeout_ms
+            let batch_size = config.rescue_batch_size;
+
+            // 调用 rescue，传入 timeout 原始值，让底层决定怎么算
+            match self
+                .inner
+                .ctx
+                .queue
+                .rescue(&self.inner.ctx.node_id, now, timeout_ms, batch_size)
+                .await
+            {
+                Ok(ids) => {
+                    if !ids.is_empty() {
+                        // log...
+                    }
+                }
+                Err(e) => error!("Rescue failed: {:?}", e),
             }
         }
     }
