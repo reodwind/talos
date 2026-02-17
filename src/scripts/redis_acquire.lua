@@ -34,7 +34,7 @@ for i, task_id in ipairs(tasks) do
 
     -- 5. 收集结果 [id1, epoch1, id2, epoch2, ...]
     table.insert(result, task_id)
-    table.insert(result, new_epoch)
+    table.insert(result, tostring(new_epoch))
 end
 
 return result
