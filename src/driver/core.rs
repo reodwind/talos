@@ -164,14 +164,13 @@ where
     /// 任务拉取主循环
     ///
     /// 职责：
-    /// 1. 监听起搏器 (Pacemaker) 的信号 (Trigger/Shutdown)。
+    /// 1. 监听起搏器 (Pacemaker) 的信号，决定何时尝试拉取任务。
     /// 2. 执行插件的前置检查 (before_fetch)。
     /// 3. 申请并发许可 (Semaphore)。
     /// 4. 从持久化层批量拉取任务 (Acquire)。
     /// 5. 异步分发任务 (Spawn)。
     async fn fetch_loop(&self) {
-        // [Init] 初始化起搏器
-        // 它负责管理心跳节奏、监听 Pause 信号、处理 Shutdown 信号。
+        // 创建起搏器 (Pacemaker)，传入必要的共享状态和策略
         let mut pacemaker = TaskPacemaker::new(
             &self.inner.paused,
             &self.inner.notify,

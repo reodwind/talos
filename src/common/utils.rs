@@ -1,5 +1,5 @@
 use nanoid::nanoid;
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use std::time::Duration;
 
 // ==========================================
@@ -67,19 +67,4 @@ pub fn calculate_backoff(attempt: u32, base_delay: f64, max_delay: f64) -> Durat
     let final_secs = jittered_backoff.max(0.1); // 至少 100ms
 
     Duration::from_secs_f64(final_secs)
-}
-
-// ==========================================
-// 4. 杂项 (Misc)
-// ==========================================
-
-/// 安全地截断字符串
-pub fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let mut result: String = s.chars().take(max_len).collect();
-        result.push_str("...");
-        result
-    }
 }
