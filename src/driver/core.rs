@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, trace};
 
 use crate::common::traits::SchedulableTask;
-use crate::common::{TaskContext, TaskData, TaskState, TimeUtils, calculate_backoff};
+use crate::common::{Extensions, TaskContext, TaskData, TaskState, TimeUtils, calculate_backoff};
 use crate::driver::PacemakerEvent;
 use crate::driver::context::DriverContext;
 use crate::driver::pacemaker::TaskPacemaker;
@@ -55,6 +55,8 @@ struct DriverInner<Task, T> {
     pub(crate) paused: AtomicBool,
     /// 全局的 notify，Resume 时也会触发这个
     pub(crate) notify: Notify,
+    /// 扩展容器 (可选注入，用于 Workflow ID, Trace ID 等)
+    extensions: Arc<Extensions>,
 }
 /// 任务驱动器 (The Engine)
 pub struct TaskDriver<Task, T> {
@@ -81,6 +83,7 @@ where
         task_handler: Task,
         plugins: Vec<Box<dyn DriverPlugin<T>>>,
         wait_strategy: Arc<dyn WaitStrategy>,
+        extensions: Extensions,
     ) -> Self {
         let concurrency = ctx.config.worker.max_concurrency;
         // 构建 Inner
@@ -93,6 +96,7 @@ where
             wait_strategy,
             paused: AtomicBool::new(false),
             notify: Notify::new(),
+            extensions: Arc::new(extensions),
         };
         Self {
             inner: Arc::new(inner),
@@ -334,7 +338,11 @@ where
                 return;
             }
         };
-        let runtime_ctx = TaskContext::new(task_data.clone(), token.clone());
+        let runtime_ctx = TaskContext::new(
+            task_data.clone(),
+            token.clone(),
+            self.inner.extensions.clone(),
+        );
 
         task_data.mark_running(self.inner.ctx.node_id.clone(), epoch);
         // Hook: 执行前

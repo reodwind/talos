@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
-    common::{SchedulableTask, SchedulerConfig, utils::get_hostname},
+    common::{Extensions, SchedulableTask, SchedulerConfig, utils::get_hostname},
     driver::{DriverContext, DriverMetrics, DriverPlugin, TaskDriver, plugins::MetricsPlugin},
     persistence::{TaskQueue, TaskStore, memory::MemoryPersistence},
     policy::{WaitStrategy, expbackoff::ExponentialBackoff},
@@ -27,6 +27,8 @@ pub struct TaskDriverBuilder<T> {
     queue: Option<Arc<dyn TaskQueue>>,
     /// 全局统计指标
     metrics: Arc<DriverMetrics>,
+    /// 扩展容器 (可选注入，用于 Workflow ID, Trace ID 等)
+    extensions: Extensions,
 
     shutdown: Option<CancellationToken>,
 }
@@ -52,6 +54,7 @@ where
             queue: None,
             shutdown: None,
             metrics: Arc::new(DriverMetrics::default()),
+            extensions: Extensions::default(),
         }
     }
 }
@@ -78,6 +81,7 @@ where
             wait_strategy,
             shutdown,
             metrics: Arc::new(DriverMetrics::default()),
+            extensions: Extensions::new(),
         }
     }
 }
@@ -157,6 +161,17 @@ where
         self.store = Some(Arc::new(store));
         self
     }
+    /// 批量替换/设置扩展容器
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+    /// 添加扩展数据
+    pub fn add_extension<E: Send + Sync + 'static>(&mut self, val: E) {
+        self.extensions
+            .insert(std::any::TypeId::of::<E>(), Box::new(val));
+    }
+
     /// 构建驱动器
     ///
     /// * 返回 TaskDriver
@@ -194,6 +209,12 @@ where
         // 创建上下文
         let ctx = DriverContext::new(node_id, store, queue, config, token);
         // 组装最终的 Driver
-        TaskDriver::new_with_components(ctx, task_handler, self.plugins, wait_strategy)
+        TaskDriver::new_with_components(
+            ctx,
+            task_handler,
+            self.plugins,
+            wait_strategy,
+            self.extensions,
+        )
     }
 }

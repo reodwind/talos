@@ -3,7 +3,7 @@ use std::{marker::PhantomData, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{SchedulableTask, SchedulerConfig},
+    common::{Extensions, SchedulableTask, SchedulerConfig},
     driver::{DriverPlugin, TaskDriverBuilder},
     persistence::{TaskQueue, TaskStore},
     policy::WaitStrategy,
@@ -28,6 +28,8 @@ pub struct WorkerBuilder<T> {
     wait_strategy: Option<Arc<dyn WaitStrategy>>,
     /// 选填: 节点 ID (默认自动生成)
     node_id: Option<String>,
+    /// 选填: 扩展容器 (可选注入，用于 Workflow ID, Trace ID 等)
+    extensions: Extensions,
     /// 全局停机信号 (可选注入，用于多组件协同)
     shutdown_token: Option<CancellationToken>,
     // 占位符，用于泛型推导
@@ -52,6 +54,7 @@ where
             queue: None,
             plugins: Vec::new(),
             wait_strategy: None,
+            extensions: Extensions::new(),
             shutdown_token: None,
             _marker: PhantomData,
         }
@@ -80,6 +83,13 @@ where
         self
     }
 
+    /// [可选] 依赖注入接口扩展
+    pub fn extension<E: Send + Sync + 'static>(mut self, val: E) -> Self {
+        self.extensions
+            .insert(std::any::TypeId::of::<E>(), Box::new(val));
+        self
+    }
+
     /// [核心] 构建 Worker
     ///
     /// 这里完成了所有组件的组装工作：
@@ -96,7 +106,8 @@ where
             self.plugins,
             self.wait_strategy,
             self.shutdown_token,
-        );
+        )
+        .with_extensions(self.extensions);
         // 组装 Driver (核心引擎)
         let driver = driver_builder.build(task);
 

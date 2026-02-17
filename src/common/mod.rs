@@ -12,7 +12,7 @@ pub use config::SchedulerConfig;
 pub use error::{Result, SchedulerError};
 
 // 导出核心模型
-pub use model::{ScheduleType, ScheduleType::*, TaskContext, TaskData, TaskState};
+pub use model::{Extensions, ScheduleType, ScheduleType::*, TaskContext, TaskData, TaskState};
 
 // 导出用户需实现的 Trait
 pub use traits::SchedulableTask;

@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{TimeUtils, new_task_id};
+
+// 定义扩展容器类型
+pub type Extensions = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
 
 // ==========================================
 // 1. 任务状态枚举 (TaskState)
@@ -299,11 +306,17 @@ pub struct TaskContext<T> {
     pub data: TaskData<T>,
     // 运行时工具 (不可序列化)
     pub token: CancellationToken,
+    // 全局扩展容器 (可选注入，用于 Workflow ID, Trace ID 等)
+    pub extensions: Arc<Extensions>,
 }
 impl<T> TaskContext<T> {
     // 构造函数：把数据和 Token 组装起来
-    pub fn new(data: TaskData<T>, token: CancellationToken) -> Self {
-        Self { data, token }
+    pub fn new(data: TaskData<T>, token: CancellationToken, extensions: Arc<Extensions>) -> Self {
+        Self {
+            data,
+            token,
+            extensions,
+        }
     }
     // 代理访问 payload，方便用户
     pub fn payload(&self) -> &T {

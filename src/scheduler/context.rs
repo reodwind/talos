@@ -1,3 +1,5 @@
+use std::any::TypeId;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::common::TaskContext;
@@ -30,6 +32,13 @@ impl JobContext {
 
     pub fn token(&self) -> &CancellationToken {
         &self.inner.token
+    }
+
+    pub fn get<T: 'static + Send + Sync>(&self) -> Option<&T> {
+        self.inner
+            .extensions
+            .get(&std::any::TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_ref())
     }
 
     /// 后门：如果用户需要直接处理二进制
