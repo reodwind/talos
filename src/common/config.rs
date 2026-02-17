@@ -56,13 +56,6 @@ pub struct WorkerConfig {
     /// - 警告: 如果任务 Payload 很大 (e.g. 1MB)，请调低此值以防 OOM。
     pub max_concurrency: usize,
 
-    /// 心跳间隔 (秒)
-    ///
-    /// - 说明: Driver 给正在运行的任务续约 Redis 锁的频率。
-    /// - 默认值: 5
-    /// - 影响: 设得太短会增加 Redis 压力；设得太长会导致节点宕机后，任务被锁住很久才能被其他节点接管。
-    pub heartbeat_interval_secs: u64,
-
     /// 轮询间隔 (秒)
     ///
     /// - 说明: 当 Pub/Sub 通知静默（无新任务）时，Driver 主动去 Redis 检查任务的间隔。
@@ -77,7 +70,6 @@ impl Default for WorkerConfig {
             workers: num_cpus::get(), // [智能默认] 自动获取核数
             queue_capacity: 1024,
             max_concurrency: 1000,
-            heartbeat_interval_secs: 5,
             poll_interval_secs: 5,
         }
     }

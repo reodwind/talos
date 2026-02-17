@@ -489,7 +489,7 @@ where
     /// 心跳包循环
     async fn heartbeat_loop(&self) {
         // 配置系统间隔时间
-        let interval = Duration::from_secs(self.inner.ctx.config.worker.heartbeat_interval_secs);
+        let interval = Duration::from_millis(self.inner.ctx.config.cluster.heartbeat_interval_ms);
 
         loop {
             sleep(interval).await;
