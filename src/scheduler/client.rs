@@ -1,11 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::bail;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 
+#[cfg(feature = "redis-store")]
+use crate::persistence::RedisPersistence;
 use crate::{
-    common::{ScheduleType, SchedulerConfig, TaskData, TimeUtils, new_task_id},
-    persistence::{RedisPersistence, TaskStore},
+    common::{ScheduleType, TaskData, TimeUtils, new_task_id},
+    persistence::TaskStore,
 };
 
 /// JSON 数据包装器
@@ -65,13 +67,13 @@ where
     pub fn new(store: Arc<dyn TaskStore<T>>) -> Self {
         Self { store }
     }
-    
+    #[cfg(feature = "redis-store")]
     pub fn new_redis(url: &str) -> anyhow::Result<Self>
     where
-        T: DeserializeOwned + Clone,
+        T: serde::de::DeserializeOwned + Clone,
     {
         // 使用默认配置
-        let config = SchedulerConfig::default();
+        let config = crate::common::SchedulerConfig::default();
         let store = Arc::new(RedisPersistence::new(&config, url)?);
         Ok(Self::new(store))
     }

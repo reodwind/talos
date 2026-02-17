@@ -1,14 +1,15 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use tokio_util::sync::CancellationToken;
-
+#[cfg(feature = "redis-store")]
+use crate::persistence::RedisPersistence;
 use crate::{
     common::{Extensions, SchedulableTask, SchedulerConfig},
     driver::{DriverPlugin, TaskDriverBuilder},
-    persistence::{RedisPersistence, TaskQueue, TaskStore},
+    persistence::{TaskQueue, TaskStore},
     policy::WaitStrategy,
     scheduler::Worker,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Worker 构建器
 ///
@@ -92,6 +93,7 @@ where
     }
 
     /// [可选] Redis 一键配置
+    #[cfg(feature = "redis-store")]
     pub fn redis(mut self, url: &str) -> anyhow::Result<Self>
     where
         T: Clone + serde::Serialize + serde::de::DeserializeOwned,

@@ -35,8 +35,11 @@ tracing = "0.1.44"
 [features]
 # 默认不开启分布式功能，保持轻量
 default = ["distributed", "workflow"]
-# 分布式启用
-distributed = ["dep:deadpool-redis", "dep:redis"]
+# redis 相关功能
+redis-store = ["dep:deadpool-redis", "dep:redis"]
+# === 功能层控制 ===
+# 分布式功能目前强依赖 Redis 存储
+distributed = ["redis-store"]
 
 workflow = []
 metrics = ["dep:metrics"]
