@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::{Extensions, SchedulableTask, SchedulerConfig},
     driver::{DriverPlugin, TaskDriverBuilder},
-    persistence::{TaskQueue, TaskStore},
+    persistence::{RedisPersistence, TaskQueue, TaskStore},
     policy::WaitStrategy,
     scheduler::Worker,
 };
@@ -38,7 +38,7 @@ pub struct WorkerBuilder<T> {
 
 impl<T> WorkerBuilder<T>
 where
-    T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    T: Send + Sync + 'static,
 {
     /// 创建一个新的构建器
     ///
@@ -72,6 +72,7 @@ where
     pub fn with_plugin<PL>(mut self, plugin: PL) -> Self
     where
         PL: DriverPlugin<T> + 'static,
+        T: Clone + serde::Serialize + serde::de::DeserializeOwned,
     {
         self.plugins.push(Box::new(plugin));
         self
@@ -90,6 +91,19 @@ where
         self
     }
 
+    /// [可选] Redis 一键配置
+    pub fn redis(mut self, url: &str) -> anyhow::Result<Self>
+    where
+        T: Clone + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let default_config = self.config.clone().unwrap_or_default();
+        let persistence = Arc::new(RedisPersistence::new(&default_config, url)?);
+        // 自动注入 Store 和 Queue
+        self.store = Some(persistence.clone());
+        self.queue = Some(persistence);
+        Ok(self)
+    }
+
     /// [核心] 构建 Worker
     ///
     /// 这里完成了所有组件的组装工作：
@@ -97,6 +111,7 @@ where
     pub fn build<Task>(self, task: Task) -> Worker<Task, T>
     where
         Task: SchedulableTask<T> + Send + Sync + 'static,
+        T: Clone + serde::Serialize + serde::de::DeserializeOwned,
     {
         let driver_builder = TaskDriverBuilder::new(
             self.node_id,

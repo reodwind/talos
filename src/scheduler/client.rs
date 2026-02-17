@@ -1,11 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::bail;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    common::{ScheduleType, TaskData, TimeUtils, new_task_id},
-    persistence::TaskStore,
+    common::{ScheduleType, SchedulerConfig, TaskData, TimeUtils, new_task_id},
+    persistence::{RedisPersistence, TaskStore},
 };
 
 /// JSON 数据包装器
@@ -65,6 +65,17 @@ where
     pub fn new(store: Arc<dyn TaskStore<T>>) -> Self {
         Self { store }
     }
+    
+    pub fn new_redis(url: &str) -> anyhow::Result<Self>
+    where
+        T: DeserializeOwned + Clone,
+    {
+        // 使用默认配置
+        let config = SchedulerConfig::default();
+        let store = Arc::new(RedisPersistence::new(&config, url)?);
+        Ok(Self::new(store))
+    }
+
     /// 提交原始 TaskData
     pub async fn submit_raw(&self, mut task: TaskData<T>) -> anyhow::Result<String> {
         // === 1. 数据完整性验证 ===
