@@ -17,24 +17,24 @@ local tasks = redis.call('ZRANGEBYSCORE', pending_zset, '-inf', now_score,
 local result = {}
 
 for i, task_id in ipairs(tasks) do
-    local meta_key = meta_prefix .. task_id
+    if redis.call('ZREM', pending_zset, task_id) == 1 then
+        local meta_key = meta_prefix .. task_id
 
-    -- 2. 原子更新 Epoch (Fencing Token)
-    -- 这是防脑裂的核心：每次抢占，版本号必须 +1
-    local new_epoch = redis.call('HINCRBY', meta_key, 'epoch', 1)
+        -- 2. 原子更新 Epoch (Fencing Token)
+        -- 这是防脑裂的核心：每次抢占，版本号必须 +1
+        local new_epoch = redis.call('HINCRBY', meta_key, 'epoch', 1)
 
-    -- 3. 更新元数据 (归属权转移)
-    redis.call('HMSET', meta_key, 'state', 'Running', 'worker_id', worker_id,
-               'updated_at', now_score)
+        -- 3. 更新元数据 (归属权转移)
+        redis.call('HMSET', meta_key, 'state', 'Running', 'worker_id',
+                   worker_id, 'updated_at', now_score)
 
-    -- 4. 移动集合: Pending -> Running
-    -- 原子性保证任务不会丢失
-    redis.call('ZREM', pending_zset, task_id)
-    redis.call('ZADD', running_zset, now_score, task_id)
+        -- 4. 移动集合: Pending -> Running
+        redis.call('ZADD', running_zset, now_score, task_id)
 
-    -- 5. 收集结果 [id1, epoch1, id2, epoch2, ...]
-    table.insert(result, task_id)
-    table.insert(result, tostring(new_epoch))
+        -- 5. 收集结果 [id1, epoch1, id2, epoch2, ...]
+        table.insert(result, task_id)
+        table.insert(result, tostring(new_epoch))
+    end
 end
 
 return result

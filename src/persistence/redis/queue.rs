@@ -122,12 +122,13 @@ impl TaskQueue for RedisPersistence {
             .arg(threshold) // ARGV[1]
             .arg(now) // ARGV[2]
             .arg(limit) // ARGV[3]
+            .arg(self.key_meta_prefix()) // ARGV[4]
             .invoke_async(&mut conn)
             .await?;
 
         Ok(result)
     }
-    
+
     async fn release(&self, task_ids: &[String], _worker_id: &str) -> Result<()> {
         let mut conn = self.pool.get().await?;
         let mut pipe = redis::pipe();
