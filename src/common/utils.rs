@@ -1,5 +1,5 @@
 use nanoid::nanoid;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::time::Duration;
 
 // ==========================================

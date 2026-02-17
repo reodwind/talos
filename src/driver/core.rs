@@ -185,6 +185,10 @@ where
             match pacemaker.wait_next().await {
                 PacemakerEvent::Trigger => {}
                 PacemakerEvent::Shutdown => break,
+                PacemakerEvent::Idle => continue,
+                PacemakerEvent::Reload => {
+                    // 目前没有动态配置的设计，但如果未来有了，这里可以处理配置重载逻辑。
+                }
             }
             // 插件流控
             let mut allow_fetch = true;

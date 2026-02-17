@@ -1,17 +1,19 @@
 use std::time::Duration;
 
+use rand::RngExt;
+
 use crate::policy::{WaitContext, WaitStrategy, wait::WaitDecision};
 
-/// 指数退避策略
+/// 指数退避策略 (AWS Full Jitter 模式)
 ///
-/// - 随着连续空闲次数增加，等待时间呈指数级增长。
-/// - 用于在系统空闲时大幅降低 Redis QPS 消耗。
+/// - 算法: `sleep = random(0, min(cap, base * 2 ** attempt))`
+/// - 这种模式在分布式系统中能最大程度地分散 Worker 的请求压力。
 #[derive(Debug, Clone)]
 pub struct ExponentialBackoff {
     min: Duration,
     max: Duration,
     factor: f64,
-    jitter: bool, // 是否开启随机抖动
+    jitter: bool,
 }
 
 impl ExponentialBackoff {
@@ -24,70 +26,60 @@ impl ExponentialBackoff {
         Self {
             min: Duration::from_millis(min_ms),
             max: Duration::from_millis(max_ms),
-            factor: 2.0, // 默认每次翻倍
-            jitter: false,
+            factor: 2.0,  // 默认每次翻倍
+            jitter: true, // 默认开启 Full Jitter
         }
     }
-
-    /// 开启随机抖动 (Jitter)
-    ///
-    /// 建议在集群模式下开启，防止所有 Worker 在同一时刻醒来（惊群效应）。
-    /// 注意：这需要依赖 `rand` crate。如果未引入 rand，这里仅做标记。
-    pub fn with_jitter(mut self) -> Self {
-        self.jitter = true;
+    /// 设置增长因子
+    /// - factor: 1.0 表示线性增长，2.0 表示指数增长
+    pub fn with_factor(mut self, factor: f64) -> Self {
+        self.factor = factor.max(1.0); // 最小为 1.0
         self
     }
-
-    /// 内部计算逻辑
-    fn calculate_duration(&self, idle_count: u32) -> Duration {
-        if idle_count == 0 {
-            return self.min;
-        }
-
-        // 1. 指数计算: min * factor^(idle_count - 1)
-        // 限制指数最大为 30，防止 overflow
-        let exponent = (idle_count - 1).min(30) as i32;
-        let mut secs = self.min.as_secs_f64() * self.factor.powi(exponent);
-
-        // 2. 随机抖动 (Jitter)
-        // 逻辑: 在 [0.8 * secs, 1.2 * secs] 之间波动
-        // 为了代码可编译性，这里使用伪代码注释。
-        // 实际项目中请引入 `rand` 并取消注释。
-        if self.jitter {
-            /*
-            let mut rng = rand::thread_rng();
-            let random_factor = rng.gen_range(0.8..1.2);
-            secs *= random_factor;
-            */
-
-            // 简易替代方案: 利用 idle_count 做个伪随机，避免引入 rand 依赖
-            // (仅作演示，生产环境建议用 rand)
-            let pseudo_random = 1.0 + ((idle_count % 5) as f64 * 0.05); // 1.0 ~ 1.2
-            secs *= pseudo_random;
-        }
-
-        // 3. 封顶限制
-        let duration = Duration::from_secs_f64(secs);
-        if duration > self.max {
-            self.max
-        } else {
-            duration
-        }
+    /// 设置是否启用抖动
+    pub fn with_jitter(mut self, jitter: bool) -> Self {
+        self.jitter = jitter;
+        self
     }
 }
 
 impl WaitStrategy for ExponentialBackoff {
     fn make_decision(&self, ctx: &WaitContext) -> WaitDecision {
-        let duration = self.calculate_duration(ctx.idle_count);
+        // 1. 忙碌状态 (刚刚处理完任务) -> 立即执行
+        if ctx.idle_count == 0 {
+            return WaitDecision::Immediate;
+        }
+        // 2. 计算指数基准值
+        // 限制指数最大为 30，防止 u64 溢出
+        let exponent = (ctx.idle_count - 1).min(30) as i32;
+        let mut duration_micros =
+            (self.min.as_micros() as f64 * self.factor.powi(exponent)) as u128;
 
-        // 指数退避通常配合“监听通知”使用
-        // 意思就是：“虽然我打算睡 30秒，但如果这期间有新任务，请立刻叫醒我”
-        WaitDecision::WaitForNotification(duration)
+        // 3. 封顶限制 (Cap)
+        let max_micros = self.max.as_micros();
+        if duration_micros > max_micros {
+            duration_micros = max_micros;
+        }
+        // 4. 应用 Full Jitter
+        if self.jitter {
+            let mut rng = rand::rng();
+            // 生成一个在 [0, duration_micros] 之间的随机值
+            duration_micros = rng.random_range(0..=duration_micros);
+            // 兜底：防止睡 0ms 导致 CPU 空转，至少睡 1ms
+            if duration_micros < 1000 {
+                duration_micros = 1000;
+            }
+        }
+        let duration = Duration::from_micros(duration_micros as u64);
+        // 5. 计算绝对截止时间
+        let deadline = ctx.now_instant + duration;
+        // 指数退避期间，如果有新任务通知，允许被叫醒
+        WaitDecision::WaitForNotification(deadline)
     }
 }
 
 impl Default for ExponentialBackoff {
     fn default() -> Self {
-        Self::new(1, 5)
+        Self::new(10, 5000) // 默认: 10ms ~ 5s
     }
 }

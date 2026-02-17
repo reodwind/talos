@@ -1,9 +1,13 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
-use tokio::sync::Notify;
+use chrono::Utc;
+use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::policy::{WaitContext, WaitStrategy, wait::WaitDecision};
@@ -56,9 +60,12 @@ impl<'a> TaskPacemaker<'a> {
     /// 当没有拉取到任务时调用
     pub fn mark_idle(&mut self) {
         self.is_busy = false;
-        self.idle_count += 1;
+        self.idle_count = self.idle_count.saturating_add(1);
     }
-
+    /// 暴露状态给 Metrics
+    pub fn idle_count(&self) -> u32 {
+        self.idle_count
+    }
     /// 等待下一次动作触发
     pub async fn wait_next(&mut self) -> PacemakerEvent {
         loop {
@@ -71,43 +78,45 @@ impl<'a> TaskPacemaker<'a> {
                 tokio::select! {
                     // 监听 Token 取消
                     _ = self.shutdown.cancelled() => return PacemakerEvent::Shutdown,
-                    _ = self.notify.notified() => continue,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
                 }
             }
-            // 3. Wait Strategy
-            let decision = if self.is_busy {
-                WaitDecision::Immediate
-            } else {
-                let ctx = WaitContext::new(self.idle_count);
-                self.wait_strategy.make_decision(&ctx)
-            };
+            // 捕获时间快照 (仅用于传给策略)
+            let now_instant = Instant::now();
+            let now_wall = Utc::now();
 
+            // 3. 获取策略决策
+            let ctx = WaitContext::new(self.idle_count, now_instant, now_wall);
+            let decision = self.wait_strategy.make_decision(&ctx);
+
+            // 执行决策
             match decision {
                 WaitDecision::Immediate => return PacemakerEvent::Trigger,
-
-                WaitDecision::Sleep(duration) => {
+                WaitDecision::Yield => {
+                    tokio::task::yield_now().await;
+                    return PacemakerEvent::Trigger;
+                }
+                // 硬等待：不管有没有信号，必须睡到这个点
+                WaitDecision::WaitUntil(deadline) => {
                     tokio::select! {
-                        // 监听 Token 取消
                         _ = self.shutdown.cancelled() => return PacemakerEvent::Shutdown,
-                        _ = self.notify.notified() => {
-                            self.mark_busy();
-                            return PacemakerEvent::Trigger;
-                        },
-                        _ = tokio::time::sleep(duration) => return PacemakerEvent::Trigger,
+                        _ = tokio::time::sleep_until(deadline) => return PacemakerEvent::Trigger,
                     }
                 }
-
+                // 软等待：允许被 Notify 唤醒
+                WaitDecision::WaitForNotification(deadline) => {
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => return PacemakerEvent::Shutdown,
+                        _ = self.notify.notified() => return PacemakerEvent::Trigger,
+                        _ = tokio::time::sleep_until(deadline) => return PacemakerEvent::Trigger,
+                    }
+                }
                 WaitDecision::WaitIndefinitely => {
                     tokio::select! {
-                        // 监听 Token 取消
                         _ = self.shutdown.cancelled() => return PacemakerEvent::Shutdown,
-                        _ = self.notify.notified() => {
-                            self.mark_busy();
-                            return PacemakerEvent::Trigger;
-                        }
+                        _ = self.notify.notified() => return PacemakerEvent::Trigger,
                     }
                 }
-                _ => return PacemakerEvent::Trigger,
             }
         }
     }
@@ -116,8 +125,12 @@ impl<'a> TaskPacemaker<'a> {
 /// 起搏器产生的事件
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacemakerEvent {
-    /// 触发拉取动作
+    /// [触发] 有任务或到了轮询时间，请立即去拉取
     Trigger,
-    /// 系统关闭
+    /// [空闲] 虽然没任务，但 Pacemaker 醒来告诉你一声，继续保持等待状态
+    Idle,
+    /// [重载] 配置已变更，请 Driver 重新加载配置
+    Reload,
+    /// [关闭] 系统停机
     Shutdown,
 }
