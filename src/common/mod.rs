@@ -1,8 +1,8 @@
 pub mod config;
 pub mod error;
 pub mod model;
-pub mod traits;
 pub mod time;
+pub mod traits;
 pub(crate) mod utils;
 
 // 导出配置
@@ -15,7 +15,7 @@ pub use error::{Result, SchedulerError};
 pub use model::{ScheduleType, ScheduleType::*, TaskContext, TaskData, TaskState};
 
 // 导出用户需实现的 Trait
-pub use traits::{ErasedHandler, SchedulableTask, TaskHandler};
+pub use traits::SchedulableTask;
 
 pub use time::TimeUtils;
 // 内部工具的快捷访问

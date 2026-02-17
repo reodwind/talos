@@ -4,7 +4,7 @@ use anyhow::bail;
 use serde::Serialize;
 
 use crate::{
-    common::{ScheduleType, TaskData, TimeUtils, model::DynamicJob, new_task_id},
+    common::{ScheduleType, TaskData, TimeUtils, new_task_id},
     persistence::TaskStore,
 };
 
@@ -65,10 +65,48 @@ where
             .await
     }
 }
-/// 针对的是注册机制
-impl SchedulerClient<DynamicJob> {
-    pub async fn submit_dynamic(&self, name: &str, args: impl Serialize) -> anyhow::Result<String> {
-        let job = DynamicJob::new(name, serde_json::value::to_raw_value(&args)?);
-        self.submit(job, ScheduleType::Once).await
+
+impl SchedulerClient<Vec<u8>> {
+    /// 提交一个 JSON 任务
+    ///
+    /// # 参数
+    /// - `task_type`: 任务类型 (路由键)，例如 "send_email"
+    /// - `payload`: 参数结构体，会被自动序列化为 JSON Bytes
+    pub async fn submit_json<P>(&self, task_type: &str, payload: P) -> anyhow::Result<String>
+    where
+        P: Serialize + Send + Sync,
+    {
+        // 1. 序列化为 JSON 字节
+        let bytes = serde_json::to_vec(&payload)?;
+        // 2. 提交
+        self.submit_bytes(task_type, bytes, ScheduleType::Once).await
+    }
+    /// 提交一个 JSON 延时任务
+    pub async fn submit_json_delay<P>(&self, task_type: &str, payload: P, delay: Duration) -> anyhow::Result<String>
+    where
+        P: Serialize + Send + Sync,
+    {
+        let bytes = serde_json::to_vec(&payload)?;
+        self.submit_bytes(task_type, bytes, ScheduleType::Delay(delay.as_millis() as u64)).await
+    }
+
+    /// 提交一个 JSON Cron 任务
+    pub async fn submit_json_cron<P>(&self, task_type: &str, payload: P, cron: &str) -> anyhow::Result<String>
+    where
+        P: Serialize + Send + Sync,
+    {
+        let bytes = serde_json::to_vec(&payload)?;
+        self.submit_bytes(task_type, bytes, ScheduleType::Cron(cron.to_string())).await
+    }
+
+    /// 提交原始字节任务 (通用入口)
+    pub async fn submit_bytes(&self, task_type: &str, payload: Vec<u8>, schedule: ScheduleType) -> anyhow::Result<String> {
+        let task_id = new_task_id();
+        let mut task = TaskData::new(task_id, payload, schedule);
+        
+        // 关键：设置 Task Name，Router 靠这个分发
+        task.name = task_type.to_string(); 
+        
+        self.submit_raw(task).await
     }
 }

@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, trace};
@@ -216,6 +216,7 @@ where
             let current_available = semaphore.available_permits();
             // 防止 acquire_many 报错（不能申请 0 个）
             if current_available == 0 {
+                pacemaker.mark_idle();
                 continue;
             }
             let ask_size = batch_size_cfg.min(current_available);

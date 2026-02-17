@@ -318,18 +318,3 @@ impl<T> TaskContext<T> {
         self.token.cancelled().await;
     }
 }
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DynamicJob {
-    pub name: String,
-    pub args: Box<serde_json::value::RawValue>,
-}
-
-impl DynamicJob {
-    pub fn new(name: impl Into<String>, args: Box<serde_json::value::RawValue>) -> Self {
-        Self {
-            name: name.into(),
-            args,
-        }
-    }
-}

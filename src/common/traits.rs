@@ -1,9 +1,8 @@
-use async_trait::async_trait;
-use serde::de::DeserializeOwned;
-use serde_json::value::RawValue;
-
-use crate::common::model::TaskContext;
 use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::common::TaskContext;
 
 // ==========================================
 // 2. 核心任务接口 (SchedulableTask)
@@ -37,55 +36,14 @@ where
     /// - `Err(e)`: 任务失败，调度器将捕获错误并进行重试。
     async fn execute(&self, ctx: TaskContext<T>) -> anyhow::Result<()>;
 }
-#[async_trait]
-pub trait TaskHandler: Send + Sync + 'static {
-    /// 定义参数类型 (输入)
-    type Args: DeserializeOwned + Send + Sync + Clone + 'static;
 
-    /// 定义返回类型 (输出)
-    type Output: Send + Sync + 'static;
-
-    async fn handle(&self, args: Self::Args) -> anyhow::Result<Self::Output>;
-
-    async fn on_result(
-        &self,
-        _args: Self::Args,
-        _res: &anyhow::Result<Self::Output>,
-    ) -> anyhow::Result<bool>;
-}
-#[async_trait]
-pub trait ErasedHandler: Send + Sync {
-    async fn handle_erased(&self, args: Box<RawValue>) -> anyhow::Result<()>;
-}
-#[async_trait]
-impl<H> ErasedHandler for H
-where
-    H: TaskHandler + Clone,
-{
-    async fn handle_erased(&self, args: Box<RawValue>) -> anyhow::Result<()> {
-        let this = self.clone();
-        let typed_args: H::Args = match serde_json::from_str(args.get()) {
-            Ok(v) => v,
-            Err(e) => return Err(anyhow::anyhow!("Args parse failed: {}", e)),
-        };
-        let result = this.handle(typed_args.clone()).await;
-
-        // 触发回调
-        let _ = this.on_result(typed_args, &result).await;
-
-        // 抹除返回值类型，只返回 Result<()>
-        result.map(|_| ())
-    }
-}
-// 让 Arc<Task> 自动实现 SchedulableTask
+/// 为 Arc<Task> 自动实现 SchedulableTask<T>
 #[async_trait]
 impl<T, Task> SchedulableTask<T> for Arc<Task>
 where
     T: Send + Sync + Clone + 'static,
-    Task: SchedulableTask<T>, // 内部必须实现了 SchedulableTask
+    Task: SchedulableTask<T>,
 {
-    // type Output = Task::Output; // 转发内部的 Output 类型
-
     async fn execute(&self, ctx: TaskContext<T>) -> anyhow::Result<()> {
         (**self).execute(ctx).await
     }

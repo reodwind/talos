@@ -3,11 +3,11 @@ use std::{marker::PhantomData, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{SchedulableTask, SchedulerConfig, model::DynamicJob},
+    common::{SchedulableTask, SchedulerConfig},
     driver::{DriverPlugin, TaskDriverBuilder},
     persistence::{TaskQueue, TaskStore},
     policy::WaitStrategy,
-    scheduler::{Worker, registry::TaskRegistry},
+    scheduler::Worker,
 };
 
 /// Worker 构建器
@@ -101,23 +101,6 @@ where
         let driver = driver_builder.build(task);
 
         // 返回包装好的 Worker
-        Worker { driver }
-    }
-}
-
-impl WorkerBuilder<DynamicJob> {
-    pub fn build_registry(self) -> Worker<TaskRegistry, DynamicJob> {
-        let handler = TaskRegistry::new();
-        let driver_builder = TaskDriverBuilder::new(
-            self.node_id,
-            self.config,
-            self.store,
-            self.queue,
-            self.plugins,
-            self.wait_strategy,
-            self.shutdown_token,
-        );
-        let driver = driver_builder.build(handler);
         Worker { driver }
     }
 }

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{common::SchedulableTask, driver::TaskDriver, persistence::TaskStore};
+use crate::{
+    common::SchedulableTask, driver::TaskDriver, persistence::TaskStore,
+    scheduler::builder::WorkerBuilder,
+};
 
 /// 消费者工作节点 (The Public Face)
 ///
@@ -21,6 +24,11 @@ where
     H: SchedulableTask<T> + Send + Sync + 'static,
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned + 'static,
 {
+    /// 创建一个 Worker Builder
+    /// - 默认泛型 T 为 Vec<u8>，适配 TaskRouter 模式
+    pub fn builder() -> WorkerBuilder<Vec<u8>> {
+        WorkerBuilder::<Vec<u8>>::new()
+    }
     /// [入口] 启动 Worker
     ///
     /// 这是一个异步阻塞方法。它会启动 Driver 的主循环。
