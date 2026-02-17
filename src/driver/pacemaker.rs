@@ -115,6 +115,7 @@ impl<'a> TaskPacemaker<'a> {
                     tokio::select! {
                         _ = self.shutdown.cancelled() => return PacemakerEvent::Shutdown,
                         _ = self.notify.notified() => return PacemakerEvent::Trigger,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => return PacemakerEvent::Idle,
                     }
                 }
             }
