@@ -526,7 +526,6 @@ where
                             "[Driver] Split Brain detected! Task {} lost ownership. Cancelling...",
                             task_id
                         );
-                        self.inner.running_tasks.remove(&task_id);
                         // 立即处决本地任务
                         self.cancel_task(&task_id);
                     }
