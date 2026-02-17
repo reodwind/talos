@@ -8,6 +8,52 @@ use crate::{
     persistence::TaskStore,
 };
 
+/// JSON 数据包装器
+///
+/// 使用此包装器来告诉 Client 将数据序列化为 JSON。
+///
+/// # Example
+/// ```rust
+/// client.submit("email", Json(my_struct), ...).await?;
+/// ```
+pub struct Json<T>(pub T);
+
+/// 原始字节包装器
+///
+/// 使用此包装器来告诉 Client 直接使用原始字节（Zero-Copy）。
+///
+/// # Example
+/// ```rust
+/// client.submit("video", Bytes(vec![0x01, 0x02]), ...).await?;
+/// ```
+pub struct Bytes(pub Vec<u8>);
+
+// ==========================================
+// Payload 转换 Trait
+// ==========================================
+/// 定义如何将不同类型的数据转换为任务 Payload (Vec<u8>)
+pub trait IntoPayload {
+    fn into_payload(self) -> anyhow::Result<Vec<u8>>;
+}
+impl<T> IntoPayload for Json<T>
+where
+    T: Serialize,
+{
+    fn into_payload(self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(&self.0).map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))
+    }
+}
+
+impl IntoPayload for Bytes {
+    fn into_payload(self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.0)
+    }
+}
+
+// ==========================================
+// SchedulerClient 实现
+// ==========================================
+
 pub struct SchedulerClient<T> {
     store: Arc<dyn TaskStore<T>>,
 }
@@ -31,82 +77,88 @@ where
         TimeUtils::validate_schedule(&task.schedule_type)?;
 
         let now = TimeUtils::now();
-        task.next_poll_at =
-            TimeUtils::next_initial_time(&task.schedule_type, task.timezone.as_deref(), now);
-        task.created_at = now;
-        task.updated_at = now;
+        if task.created_at == 0.0 {
+            task.created_at = now;
+            task.updated_at = now;
+            task.next_poll_at =
+                TimeUtils::next_initial_time(&task.schedule_type, task.timezone.as_deref(), now);
+        }
 
         let task_id = task.id.clone();
 
         self.store.save(&task).await?;
         Ok(task_id)
     }
-
-    // 提交通用任务
-    pub async fn submit(&self, payload: T, schedule: ScheduleType) -> anyhow::Result<String> {
-        let task_id = new_task_id();
-        let task = TaskData::new(task_id.clone(), payload, schedule);
-        self.submit_raw(task).await
-    }
-    // 提交实时任务
-    pub async fn submit_now(&self, payload: T) -> anyhow::Result<String> {
-        let task_id = new_task_id();
-        let task = TaskData::new(task_id.clone(), payload, ScheduleType::Once);
-        self.submit_raw(task).await
-    }
-    /// 提交延时任务
-    pub async fn submit_delay(&self, payload: T, delay: Duration) -> anyhow::Result<String> {
-        self.submit(payload, ScheduleType::Delay(delay.as_millis() as u64))
-            .await
-    }
-    /// 提交Cron任务
-    pub async fn submit_cron(&self, payload: T, cron_expr: &str) -> anyhow::Result<String> {
-        self.submit(payload, ScheduleType::Cron(cron_expr.to_string()))
-            .await
-    }
 }
 
 impl SchedulerClient<Vec<u8>> {
-    /// 提交一个 JSON 任务
+    /// 通用提交入口 (一次性任务)
     ///
     /// # 参数
-    /// - `task_type`: 任务类型 (路由键)，例如 "send_email"
-    /// - `payload`: 参数结构体，会被自动序列化为 JSON Bytes
-    pub async fn submit_json<P>(&self, task_type: &str, payload: P) -> anyhow::Result<String>
+    /// - `task_type`: 任务类型 (路由键)
+    /// - `payload`: 数据包装器，支持 `Json(...)` 或 `Bytes(...)`
+    ///
+    /// # 示例
+    /// ```rust
+    /// client.submit("email", Json(args)).await?;
+    /// client.submit("video", Bytes(data)).await?;
+    /// ```
+    pub async fn submit<P>(&self, task_type: &str, payload: P) -> anyhow::Result<String>
     where
-        P: Serialize + Send + Sync,
+        P: IntoPayload,
     {
-        // 1. 序列化为 JSON 字节
-        let bytes = serde_json::to_vec(&payload)?;
-        // 2. 提交
-        self.submit_bytes(task_type, bytes, ScheduleType::Once).await
+        self.submit_with_schedule(task_type, payload, ScheduleType::Once)
+            .await
     }
-    /// 提交一个 JSON 延时任务
-    pub async fn submit_json_delay<P>(&self, task_type: &str, payload: P, delay: Duration) -> anyhow::Result<String>
+    /// 提交延时任务
+    pub async fn submit_delay<P>(
+        &self,
+        task_type: &str,
+        payload: P,
+        delay: Duration,
+    ) -> anyhow::Result<String>
     where
-        P: Serialize + Send + Sync,
+        P: IntoPayload,
     {
-        let bytes = serde_json::to_vec(&payload)?;
-        self.submit_bytes(task_type, bytes, ScheduleType::Delay(delay.as_millis() as u64)).await
+        self.submit_with_schedule(
+            task_type,
+            payload,
+            ScheduleType::Delay(delay.as_millis() as u64),
+        )
+        .await
     }
 
-    /// 提交一个 JSON Cron 任务
-    pub async fn submit_json_cron<P>(&self, task_type: &str, payload: P, cron: &str) -> anyhow::Result<String>
+    /// 提交 Cron 定时任务
+    pub async fn submit_cron<P>(
+        &self,
+        task_type: &str,
+        payload: P,
+        cron: &str,
+    ) -> anyhow::Result<String>
     where
-        P: Serialize + Send + Sync,
+        P: IntoPayload,
     {
-        let bytes = serde_json::to_vec(&payload)?;
-        self.submit_bytes(task_type, bytes, ScheduleType::Cron(cron.to_string())).await
+        self.submit_with_schedule(task_type, payload, ScheduleType::Cron(cron.to_string()))
+            .await
     }
+    /// [全能入口] 指定任意调度类型
+    pub async fn submit_with_schedule<P>(
+        &self,
+        task_type: &str,
+        payload: P,
+        schedule: ScheduleType,
+    ) -> anyhow::Result<String>
+    where
+        P: IntoPayload,
+    {
+        // 1. 利用 Trait 统一处理序列化
+        let bytes = payload.into_payload()?;
 
-    /// 提交原始字节任务 (通用入口)
-    pub async fn submit_bytes(&self, task_type: &str, payload: Vec<u8>, schedule: ScheduleType) -> anyhow::Result<String> {
-        let task_id = new_task_id();
-        let mut task = TaskData::new(task_id, payload, schedule);
-        
-        // 关键：设置 Task Name，Router 靠这个分发
-        task.name = task_type.to_string(); 
-        
+        // 2. 构建任务
+        let mut task = TaskData::new(new_task_id(), bytes, schedule);
+        task.name = task_type.to_string();
+
+        // 3. 提交
         self.submit_raw(task).await
     }
 }
