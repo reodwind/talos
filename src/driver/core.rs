@@ -13,7 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, trace};
 
 use crate::common::traits::SchedulableTask;
-use crate::common::{Extensions, TaskContext, TaskData, TaskState, TimeUtils, calculate_backoff};
+use crate::common::{
+    Extensions, SchedulerError, TaskContext, TaskData, TaskState, TimeUtils, calculate_backoff,
+};
 use crate::driver::PacemakerEvent;
 use crate::driver::context::DriverContext;
 use crate::driver::pacemaker::TaskPacemaker;
@@ -147,6 +149,11 @@ where
         // 3. 等待所有拉取协程退出
         while let Some(_) = join_set.join_next().await {}
 
+        // 4. 等待正在运行的任务完成
+        let mut check_interval = tokio::time::interval(Duration::from_millis(100));
+        while !self.inner.running_tasks.is_empty() {
+            check_interval.tick().await;
+        }
         // [Hook] 关闭
         for p in self.inner.plugins.iter() {
             p.on_shutdown(&self.inner.ctx).await;
@@ -501,16 +508,33 @@ where
             const BATCH_SIZE: usize = 100;
             for batch in tasks.chunks(BATCH_SIZE) {
                 // 2. 发送心跳
-                if let Err(e) = self
+                match self
                     .inner
                     .ctx
                     .queue
                     .heartbeat(&batch, &self.inner.ctx.node_id)
                     .await
                 {
-                    trace!("[Driver] Heartbeat failed: {:?}", e);
-                    // 可选：防止日志刷屏
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(_) => {}
+                    Err(SchedulerError::FencingTokenMismatch {
+                        task_id,
+                        expected: _,
+                        actual: _,
+                    }) => {
+                        // 处理脑裂 (Fencing)
+                        error!(
+                            "[Driver] Split Brain detected! Task {} lost ownership. Cancelling...",
+                            task_id
+                        );
+                        self.inner.running_tasks.remove(&task_id);
+                        // 立即处决本地任务
+                        self.cancel_task(&task_id);
+                    }
+                    Err(e) => {
+                        trace!("[Driver] Heartbeat failed: {:?}", e);
+                        // 可选：防止日志刷屏
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
             }
         }
