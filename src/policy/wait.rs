@@ -62,13 +62,18 @@ pub enum WaitDecision {
 #[derive(Debug, Clone)]
 pub struct WaitContext {
     /// 连续空闲次数
+    ///
     /// 表示 Driver 已经连续多少次去拉取任务却返回了空。
     /// - 0: 表示刚刚处理完一个任务（忙碌状态）。
     /// - >0: 表示系统处于空闲状态。
     pub idle_count: u32,
-    /// 供策略计算相对时间戳使用，表示当前的绝对时间点（Instant），策略可以基于这个时间点计算未来的 Deadline。
+    /// [单调时钟] 用于计算相对 Duration 和构建 Tokio Timer
+    ///
+    /// - 特性：永不倒流，不受 NTP/手动改时间影响
     pub now_instant: Instant,
-    /// 供策略计算 Cron/时区相关的决策使用，表示当前的绝对时间点（DateTime<Utc>），策略可以基于这个时间点计算未来的 Cron 时间。
+    /// [现实时钟] 用于日历计算、Cron 解析、时区判断
+    ///
+    /// - 特性：带日期信息，但可能会发生跳变 (NTP)
     pub now_wall: DateTime<Utc>,
 }
 
@@ -93,7 +98,10 @@ pub trait WaitStrategy: Send + Sync + 'static {
     fn make_decision(&self, ctx: &WaitContext) -> WaitDecision;
 }
 
-/// 组合策略链 (Strategy Chain)
+/// 组合策略链 (Arbitrator)
+///
+/// 核心职责：解决多个策略之间的冲突。
+/// - 例如：一个策略说 Yield，另一个说 WaitUntil(T)，链条必须决定听谁的。
 pub struct WaitStrategyChain {
     strategies: Vec<Box<dyn WaitStrategy>>,
 }
@@ -115,23 +123,15 @@ impl WaitStrategyChain {
     }
 }
 
-impl WaitStrategy for WaitStrategyChain {
-    fn make_decision(&self, ctx: &WaitContext) -> WaitDecision {
-        // 如果没有策略，默认立即执行
-        if self.strategies.is_empty() {
-            return WaitDecision::Immediate;
-        }
-        let mut final_decision = WaitDecision::Immediate;
-        for strategy in &self.strategies {
-            let current = strategy.make_decision(ctx);
-            final_decision = Self::merge(final_decision, current);
-        }
-        final_decision
-    }
-}
-
 impl WaitStrategyChain {
     /// 核心逻辑：合并两个决策，返回更“保守”的那一个
+    ///
+    /// 优先级顺序 (由高到低):
+    /// 1. WaitIndefinitely (死等)
+    /// 2. WaitUntil (硬等待，取最晚时间)
+    /// 3. WaitForNotification (软等待，取最晚时间)
+    /// 4. Yield (让权)
+    /// 5. Immediate (立即)
     fn merge(a: WaitDecision, b: WaitDecision) -> WaitDecision {
         use WaitDecision::*;
 
@@ -153,11 +153,11 @@ impl WaitStrategyChain {
         let dead_a = get_deadline(a);
         let dead_b = get_deadline(b);
 
-        // 2. 都有 Deadline，取最晚 (更保守)
-        // 两个都是硬等待 -> 取最晚的那个时间 (Max)
+        // 2. [次高优先级] 都有 Deadline -> 取最晚 (更保守)
         if let (Some(ta), Some(tb)) = (dead_a, dead_b) {
             let max_t = if ta > tb { ta } else { tb };
-            // 只要有一方是硬等待 (WaitUntil)，结果就是硬等待
+            // 冲突解决：如果有一方是 "硬等待" (WaitUntil)，结果升级为 "硬等待"
+            // (例如：限流器强制要求等到 T，即使空闲策略只要求软等待，也必须硬等)
             let is_hard = matches!(a, WaitUntil(_)) || matches!(b, WaitUntil(_));
             return if is_hard {
                 WaitUntil(max_t)
@@ -165,7 +165,7 @@ impl WaitStrategyChain {
                 WaitForNotification(max_t)
             };
         }
-        // 一个是硬等待，一个是其他 -> 硬等待胜出
+        // 3. [中优先级] 有 Deadline 胜过 无 Deadline
         if dead_a.is_some() {
             return a;
         }
@@ -181,5 +181,21 @@ impl WaitStrategyChain {
 
         // 5. [默认] Immediate
         Immediate
+    }
+}
+
+impl WaitStrategy for WaitStrategyChain {
+    fn make_decision(&self, ctx: &WaitContext) -> WaitDecision {
+        // 如果没有策略，默认立即执行
+        if self.strategies.is_empty() {
+            return WaitDecision::Immediate;
+        }
+        let mut final_decision = WaitDecision::Immediate;
+        // 遍历所有策略，两两合并决策，最终得到一个综合的决策
+        for strategy in &self.strategies {
+            let current = strategy.make_decision(ctx);
+            final_decision = Self::merge(final_decision, current);
+        }
+        final_decision
     }
 }
