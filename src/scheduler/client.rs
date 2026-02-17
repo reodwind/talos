@@ -68,12 +68,15 @@ where
         Self { store }
     }
     #[cfg(feature = "redis-store")]
-    pub fn new_redis(url: &str) -> anyhow::Result<Self>
+    pub fn new_redis(
+        url: &str,
+        config: Option<crate::common::SchedulerConfig>,
+    ) -> anyhow::Result<Self>
     where
         T: serde::de::DeserializeOwned + Clone,
     {
         // 使用默认配置
-        let config = crate::common::SchedulerConfig::default();
+        let config = config.unwrap_or_default();
         let store = Arc::new(RedisPersistence::new(&config, url)?);
         Ok(Self::new(store))
     }
@@ -88,14 +91,6 @@ where
             task.name = "default".to_string()
         }
         TimeUtils::validate_schedule(&task.schedule_type)?;
-
-        let now = TimeUtils::now();
-        if task.created_at == 0.0 {
-            task.created_at = now;
-            task.updated_at = now;
-            task.next_poll_at =
-                TimeUtils::next_initial_time(&task.schedule_type, task.timezone.as_deref(), now);
-        }
 
         let task_id = task.id.clone();
 
