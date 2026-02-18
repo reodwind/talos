@@ -152,11 +152,16 @@ pub struct PolicyConfig {
 
     /// 僵尸任务检测阈值 (毫秒)
     ///
-    /// - 说明: 如果任务上次心跳时间超过此值，视为 Worker 崩溃。
+    /// - 说明: Worker 心跳超过这个时间未更新，视为僵尸任务。
     /// - 默认值: 30,000 ms (30秒)
     /// - 建议: 设为 `heartbeat_interval_ms` 的 3~5 倍。
     pub zombie_check_interval_ms: u64,
-
+    /// 僵尸任务判定阈值 (毫秒)
+    ///
+    /// - 说明: 任务从 Running 状态开始，如果超过这个时间还未完成，视为僵尸任务。
+    /// - 默认值: 60,000 ms (1分钟)
+    /// - 建议: 根据任务的平均执行时间调整，确保正常任务不会被误判为僵尸任务。
+    pub zombie_threshold_ms: u64,
     /// 每次回收僵尸任务的最大数量
     ///
     /// - 默认: 50
@@ -184,6 +189,7 @@ impl Default for PolicyConfig {
             execution_mode: ExecutionMode::WorkerPool,
             callback_mode: CallbackMode::Sync,
             zombie_check_interval_ms: 30_000,
+            zombie_threshold_ms: 60_000,
             rescue_batch_size: 50,
             max_zombie_retries: 3,
             submit_timeout_ms: 2000,

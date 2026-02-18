@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, trace};
+use tracing::{error, info, instrument, trace};
 
 use crate::common::traits::SchedulableTask;
 use crate::common::{
@@ -23,57 +23,538 @@ use crate::driver::plugin::DriverPlugin;
 use crate::persistence::{AcquireItem, LoadStatus, TaskStore};
 use crate::policy::WaitStrategy;
 
-/// 许可守卫 (PermitGuard) - 用于批量占座的 RAII 结构体
+// =========================================================================
+// 1. 基础数据结构
+// =========================================================================
+
+/// 运行中的任务句柄
+struct RunningTaskHandle {
+    epoch: u64,
+    token: CancellationToken,
+}
+
+/// 许可守卫 (RAII) - Drop 时自动归还信号量
 struct PermitGuard {
     semaphore: Arc<Semaphore>,
     permits: u32,
 }
-/// 释放许可时自动归还给信号量
+
 impl Drop for PermitGuard {
     fn drop(&mut self) {
         self.semaphore.add_permits(self.permits as usize);
     }
 }
 
-struct RunningTaskHandle {
-    epoch: u64,
-    token: CancellationToken,
-}
-/// 驱动器Inner 结构体
-struct DriverInner<Task, T> {
-    /// 全局上下文
+// =========================================================================
+// 2. 共享状态 (Shared State)
+// =========================================================================
+
+/// 驱动器共享状态容器
+struct DriverSharedState<T> {
     ctx: DriverContext<T>,
-    /// 用户具体的任务实现
-    task_handler: Task,
-    /// 正在运行的任务注册表 (ID -> {Epoch,cancel_tx})
-    running_tasks: DashMap<String, RunningTaskHandle>,
-    /// 并发控制信号量
+    registry: DashMap<String, RunningTaskHandle>,
     semaphore: Arc<Semaphore>,
-    /// 插件系统
     plugins: Vec<Box<dyn DriverPlugin<T>>>,
-    /// 组合等待策略
-    pub wait_strategy: Arc<dyn WaitStrategy>,
-    /// 全局暂停开关
-    pub(crate) paused: AtomicBool,
-    /// 全局的 notify，Resume 时也会触发这个
-    pub(crate) notify: Notify,
-    /// 扩展容器 (可选注入，用于 Workflow ID, Trace ID 等)
+    wait_strategy: Arc<dyn WaitStrategy>,
     extensions: Arc<Extensions>,
+    paused: AtomicBool,
+    notify: Notify,
 }
-/// 任务驱动器 (The Engine)
+
+impl<T> DriverSharedState<T> {
+    fn new(
+        ctx: DriverContext<T>,
+        plugins: Vec<Box<dyn DriverPlugin<T>>>,
+        wait_strategy: Arc<dyn WaitStrategy>,
+        extensions: Extensions,
+    ) -> Self {
+        let concurrency = ctx.config.worker.max_concurrency;
+        Self {
+            ctx,
+            registry: DashMap::new(),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
+            plugins,
+            wait_strategy,
+            extensions: Arc::new(extensions),
+            paused: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.ctx.is_shutdown()
+    }
+}
+
+// =========================================================================
+// 3. 执行器 (Executor)
+// =========================================================================
+
+/// 专注负责任务的执行生命周期
+struct TaskExecutor<Task, T> {
+    state: Arc<DriverSharedState<T>>,
+    handler: Arc<Task>,
+}
+
+impl<Task, T> TaskExecutor<Task, T>
+where
+    Task: SchedulableTask<T> + Send + Sync + 'static,
+    T: Send + Sync + Clone + 'static,
+{
+    /// 执行管线：Load -> Hooks -> Execute -> Ack/Fail -> Hooks
+    #[instrument(
+        name = "exec_task",
+        skip(self, token),
+        fields(task_id = %task_id, epoch = %epoch)
+    )]
+    async fn process_pipeline(&self, task_id: String, epoch: u64, token: CancellationToken) {
+        // 1. Load Data
+        let task_data = match self.load_task_data(&task_id).await {
+            Some(data) => data,
+            None => {
+                trace!("Task data load failed or corrupted, skipping execution");
+                return;
+            } // 数据已损坏或丢失，跳过
+        };
+
+        // 2. Prepare Context
+        let runtime_ctx = TaskContext::new(
+            task_data.clone(),
+            token.clone(),
+            self.state.extensions.clone(),
+        );
+
+        let mut task_data = task_data;
+        task_data.mark_running(self.state.ctx.node_id.clone(), epoch);
+
+        // 3. Before Hook
+        for p in self.state.plugins.iter() {
+            p.before_execute(&runtime_ctx).await;
+        }
+
+        // 4. Execute (Panic Safe)
+        let start_time = TimeUtils::now();
+        let result = AssertUnwindSafe(self.handler.execute(runtime_ctx.clone()))
+            .catch_unwind()
+            .await;
+        let duration = TimeUtils::now() - start_time;
+
+        // 5. After Hook
+        for p in self.state.plugins.iter() {
+            p.after_execute(&runtime_ctx, duration).await;
+        }
+
+        // 6. Handle Result
+        match result {
+            Ok(Ok(_)) => {
+                for p in self.state.plugins.iter() {
+                    p.on_success(&runtime_ctx).await;
+                }
+                self.finalize_success(task_data).await;
+            }
+            Ok(Err(e)) => {
+                let err_msg = e.to_string();
+                for p in self.state.plugins.iter() {
+                    p.on_failure(&runtime_ctx, &err_msg).await;
+                }
+                self.finalize_failure(task_data, err_msg).await;
+            }
+            Err(panic_err) => {
+                let msg = Self::format_panic(panic_err);
+                error!("[Executor] Task {} panicked: {}", task_id, msg);
+                for p in self.state.plugins.iter() {
+                    p.on_failure(&runtime_ctx, &msg).await;
+                }
+                self.finalize_failure(task_data, msg).await;
+            }
+        }
+        trace!("Task execution pipeline finished");
+        // 7. Cleanup Registry
+        self.state.registry.remove(&task_id);
+    }
+
+    /// 辅助：加载任务数据
+    #[instrument(skip(self), level = "trace")]
+    async fn load_task_data(&self, task_id: &str) -> Option<TaskData<T>> {
+        let store = &self.state.ctx.store;
+        match store.load(task_id).await {
+            Ok(LoadStatus::Found(data)) => Some(data),
+            Ok(LoadStatus::DataCorrupted { .. }) | Ok(LoadStatus::NotFound) => {
+                // 脏数据自动清理
+                let _ = store.remove(task_id).await;
+                self.state.registry.remove(task_id);
+                None
+            }
+            Err(e) => {
+                error!(error = ?e, "Load task failed");
+                self.state.registry.remove(task_id);
+                None
+            }
+        }
+    }
+
+    /// 辅助：处理成功
+    #[instrument(skip(self, task), fields(task_id = %task.id), level = "debug")]
+    async fn finalize_success(&self, mut task: TaskData<T>) {
+        trace!("Handling task success");
+        let queue = &self.state.ctx.queue;
+        let store = &self.state.ctx.store;
+
+        // 释放运行锁
+        let _ = queue
+            .release(&[task.id.clone()], &self.state.ctx.node_id)
+            .await;
+
+        let now = TimeUtils::now_f64();
+        // 计算下次时间（如果是周期任务）
+        let next_time =
+            TimeUtils::next_recurrence_time(&task.schedule_type, task.timezone.as_deref(), now);
+
+        if let Some(ts) = next_time {
+            task.next_poll_at = ts;
+            task.state = TaskState::Pending;
+            task.epoch = 0;
+            task.worker_id = None;
+            task.updated_at = now;
+            if let Err(e) = store.requeue(task).await {
+                error!("[Executor] Requeue failed: {:?}", e);
+            }
+        } else {
+            if let Err(e) = store.remove(&task.id).await {
+                error!("[Executor] Remove failed: {:?}", e);
+            }
+        }
+    }
+
+    /// 辅助：处理失败
+    #[instrument(skip(self, task), fields(task_id = %task.id), level = "warn")]
+    async fn finalize_failure(&self, mut task: TaskData<T>, err_msg: String) {
+        let queue = &self.state.ctx.queue;
+        let store = &self.state.ctx.store;
+        error!(error = %err_msg, "Task execution failed");
+        let _ = queue
+            .release(&[task.id.clone()], &self.state.ctx.node_id)
+            .await;
+
+        if task.can_retry() {
+            task.last_error = Some(err_msg);
+            let backoff = calculate_backoff(task.attempt, 1.0, 3600.0);
+            task.next_poll_at = TimeUtils::now() + backoff.as_secs_f64();
+            task.state = TaskState::Pending;
+            task.epoch = 0;
+            task.worker_id = None;
+            task.updated_at = TimeUtils::now();
+
+            if let Err(e) = store.requeue(task.clone()).await {
+                error!("[Executor] Retry failed: {:?}", e);
+            }
+        } else {
+            if let Err(e) = store.move_to_dlq(&task, err_msg).await {
+                error!("[Executor] DLQ move failed: {:?}", e);
+            }
+        }
+    }
+
+    fn format_panic(err: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = err.downcast_ref::<&str>() {
+            format!("Panic: {}", s)
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            format!("Panic: {}", s)
+        } else {
+            "Panic: Unknown error".to_string()
+        }
+    }
+}
+
+// =========================================================================
+// 4. 消费者 (Consumer)
+// =========================================================================
+
+/// 任务消费者
+///
+/// 职责：
+/// 1. 运行起搏器 (Pacemaker)
+/// 2. 申请信号量
+/// 3. 从队列拉取任务
+/// 4. 派发给 Executor
+struct TaskConsumer<Task, T> {
+    state: Arc<DriverSharedState<T>>,
+    executor: Arc<TaskExecutor<Task, T>>,
+}
+
+impl<Task, T> TaskConsumer<Task, T>
+where
+    Task: SchedulableTask<T> + Send + Sync + 'static,
+    T: Send + Sync + Clone + 'static,
+{
+    #[instrument(name = "consumer", skip_all, fields(node_id = %self.state.ctx.node_id))]
+    async fn run_loop(&self) {
+        let mut pacemaker = TaskPacemaker::new(
+            &self.state.paused,
+            &self.state.notify,
+            &self.state.ctx.shutdown,
+            self.state.wait_strategy.clone(),
+        );
+        let batch_size = self.state.ctx.config.cluster.acquire_batch_size;
+
+        loop {
+            // 1. Pacemaker Wait
+            match pacemaker.wait_next().await {
+                PacemakerEvent::Trigger => {}
+                PacemakerEvent::Shutdown => break,
+                PacemakerEvent::Idle => continue,
+                PacemakerEvent::Reload => {}
+            }
+
+            // 2. Plugin Flow Control
+            if !self.check_plugins_allow_fetch().await {
+                pacemaker.mark_idle();
+                continue;
+            }
+
+            // 3. Acquire Permits (Semaphore)
+            let permits = match self.acquire_permits(batch_size, &mut pacemaker).await {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // 4. Acquire Tasks (Queue)
+            let ask_size = permits.permits as usize;
+            match self
+                .state
+                .ctx
+                .queue
+                .acquire(&self.state.ctx.node_id, ask_size, 3)
+                .await
+            {
+                Ok(items) => {
+                    let count = items.len();
+                    if count == 0 {
+                        pacemaker.mark_idle();
+                        continue;
+                    }
+
+                    pacemaker.mark_busy();
+                    // 优化：部分拉取时，归还多余的 Permit
+                    permits.semaphore.add_permits(ask_size - count);
+                    // 转移所有权：剩下的 Permit 交给 Spawn 里的 Guard 管理
+                    std::mem::forget(permits);
+
+                    // 5. Spawn
+                    for item in items {
+                        self.spawn_task(item).await;
+                    }
+                }
+                Err(e) => {
+                    error!("[Consumer] Acquire failed: {:?}", e);
+                    pacemaker.mark_idle();
+                    // permits Drops here, returning all permits to semaphore
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    async fn check_plugins_allow_fetch(&self) -> bool {
+        for plugin in self.state.plugins.iter() {
+            if !plugin.before_fetch(&self.state.ctx).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn acquire_permits(
+        &self,
+        batch_size: usize,
+        pacemaker: &mut TaskPacemaker<'_>,
+    ) -> Option<PermitGuard> {
+        let available = self.state.semaphore.available_permits();
+        // 如果完全满载，挂起等待至少一个空位，而不是忙轮询
+        if available == 0 {
+            match tokio::time::timeout(Duration::from_secs(1), self.state.semaphore.acquire()).await
+            {
+                Ok(Ok(p)) => drop(p), // 等到了，立即释放，准备批量申请
+                _ => {
+                    pacemaker.mark_idle(); // 等太久，退避一下
+                    return None;
+                }
+            }
+        }
+
+        let current_avail = self.state.semaphore.available_permits();
+        if current_avail == 0 {
+            return None;
+        }
+
+        let ask_size = batch_size.min(current_avail);
+        match self
+            .state
+            .semaphore
+            .clone()
+            .acquire_many_owned(ask_size as u32)
+            .await
+        {
+            Ok(_p) => Some(PermitGuard {
+                semaphore: self.state.semaphore.clone(),
+                permits: ask_size as u32,
+            }),
+            Err(_) => None,
+        }
+    }
+
+    async fn spawn_task(&self, item: AcquireItem) {
+        let executor = self.executor.clone();
+        let state = self.state.clone();
+
+        let token = CancellationToken::new();
+        state.registry.insert(
+            item.id.clone(),
+            RunningTaskHandle {
+                epoch: item.score,
+                token: token.clone(),
+            },
+        );
+
+        // 重新封装 PermitGuard，每个任务持有一个
+        let permit = PermitGuard {
+            semaphore: state.semaphore.clone(),
+            permits: 1,
+        };
+
+        tokio::spawn(async move {
+            let _guard = permit; // 任务结束自动归还 1 个信号量
+            executor.process_pipeline(item.id, item.score, token).await;
+        });
+    }
+}
+
+// =========================================================================
+// 5. 维护者 (Maintainer)
+// =========================================================================
+
+/// 系统维护服务
+///
+/// 职责：
+/// 1. 发送心跳 (Heartbeat)
+/// 2. 回收僵尸任务 (Rescue)
+struct SystemMaintainer<T> {
+    state: Arc<DriverSharedState<T>>,
+}
+
+impl<T> SystemMaintainer<T>
+where
+    T: Send + Sync + Clone + Serialize + DeserializeOwned + 'static,
+{
+    #[instrument(name = "heartbeat", skip_all)]
+    async fn start_heartbeat(&self) {
+        let interval = Duration::from_millis(self.state.ctx.config.cluster.heartbeat_interval_ms);
+        loop {
+            sleep(interval).await;
+
+            // 只有当停机且任务全空时，才停止心跳
+            if self.state.is_shutdown() && self.state.registry.is_empty() {
+                break;
+            }
+            // 快照当前任务列表
+            let tasks: Vec<(String, u64)> = self
+                .state
+                .registry
+                .iter()
+                .map(|e| (e.key().clone(), e.value().epoch))
+                .collect();
+
+            if tasks.is_empty() {
+                continue;
+            }
+            // 批量心跳
+            for batch in tasks.chunks(100) {
+                match self
+                    .state
+                    .ctx
+                    .queue
+                    .heartbeat(batch, &self.state.ctx.node_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(SchedulerError::FencingTokenMismatch { task_id, .. }) => {
+                        error!("[Maintainer] Split Brain detected! Cancelling");
+                        if let Some(handle) = self.state.registry.get(&task_id) {
+                            handle.token.cancel();
+                            self.state.registry.remove(&task_id); // 立即移除，防止下次心跳还发
+                        }
+                    }
+                    Err(e) => trace!("[Maintainer] Heartbeat err: {:?}", e),
+                }
+            }
+        }
+    }
+    /// 启动救援服务
+    #[instrument(name = "rescue", skip_all)]
+    async fn start_rescue(&self) {
+        let config = &self.state.ctx.config.policy;
+        if config.zombie_check_interval_ms == 0 {
+            return;
+        }
+
+        let interval = Duration::from_millis(config.zombie_check_interval_ms);
+        loop {
+            sleep(interval).await;
+            if self.state.is_shutdown() {
+                break;
+            }
+
+            let now = TimeUtils::now();
+            let threshold = config.zombie_threshold_ms;
+
+            match self
+                .state
+                .ctx
+                .queue
+                .rescue(
+                    &self.state.ctx.node_id,
+                    now,
+                    threshold,
+                    config.rescue_batch_size,
+                )
+                .await
+            {
+                Ok(ids) => {
+                    if !ids.is_empty() {
+                        info!("[Maintainer] Rescued {} zombies.", ids.len());
+                    }
+                }
+                Err(e) => error!("[Maintainer] Rescue failed: {:?}", e),
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 6. 任务驱动器门面 (TaskDriver - Public API)
+// =========================================================================
+
+/// 任务驱动器
 pub struct TaskDriver<Task, T> {
-    inner: Arc<DriverInner<Task, T>>, //减轻Arc Clone
-    _marker: std::marker::PhantomData<T>,
+    state: Arc<DriverSharedState<T>>,
+    executor: Arc<TaskExecutor<Task, T>>,
+    consumer: Arc<TaskConsumer<Task, T>>,
+    maintainer: Arc<SystemMaintainer<T>>,
+    _marker: PhantomData<Task>,
 }
 
 impl<Task, T> Clone for TaskDriver<Task, T> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            state: self.state.clone(),
+            executor: self.executor.clone(),
+            consumer: self.consumer.clone(),
+            maintainer: self.maintainer.clone(),
             _marker: PhantomData,
         }
     }
 }
+
 impl<Task, T> TaskDriver<Task, T>
 where
     Task: SchedulableTask<T> + Send + Sync + 'static,
@@ -87,527 +568,147 @@ where
         wait_strategy: Arc<dyn WaitStrategy>,
         extensions: Extensions,
     ) -> Self {
-        let concurrency = ctx.config.worker.max_concurrency;
-        // 构建 Inner
-        let inner = DriverInner {
+        // 1. 创建共享状态
+        let state = Arc::new(DriverSharedState::new(
             ctx,
-            task_handler,
-            running_tasks: DashMap::new(),
-            semaphore: Arc::new(Semaphore::new(concurrency)),
             plugins,
             wait_strategy,
-            paused: AtomicBool::new(false),
-            notify: Notify::new(),
-            extensions: Arc::new(extensions),
-        };
+            extensions,
+        ));
+        // 2. 创建执行器
+        let executor = Arc::new(TaskExecutor {
+            state: state.clone(),
+            handler: Arc::new(task_handler),
+        });
+        // 3. 创建消费者
+        let consumer = Arc::new(TaskConsumer {
+            state: state.clone(),
+            executor: executor.clone(),
+        });
+        // 4. 创建维护者
+        let maintainer = Arc::new(SystemMaintainer {
+            state: state.clone(),
+        });
+
         Self {
-            inner: Arc::new(inner),
+            state,
+            executor,
+            consumer,
+            maintainer,
             _marker: PhantomData,
         }
     }
 
-    /// 暴露内部储存
+    /// 对外暴露 Store (方便测试或 API 调用)
     pub fn store(&self) -> Arc<dyn TaskStore<T>> {
-        self.inner.ctx.store.clone()
+        self.state.ctx.store.clone()
     }
 
     /// 启动引擎
+    #[instrument(name = "driver_start", skip(self), fields(node_id = %self.state.ctx.node_id))]
     pub async fn start(&self) {
         // [Hook] 启动
-        for p in self.inner.plugins.iter() {
-            p.on_start(&self.inner.ctx).await;
+        for p in self.state.plugins.iter() {
+            p.on_start(&self.state.ctx).await;
         }
-
-        trace!(
-            "[Driver-{}] Started. Waiting for tasks...",
-            self.inner.ctx.node_id
-        );
-
-        // 1. 启动心跳协程
-        let heartbeat_driver = self.clone();
-        tokio::spawn(async move {
-            heartbeat_driver.heartbeat_loop().await;
-        });
-
-        // 1.1. 启动僵尸任务回收协程 (Rescue Loop)
-        // 设计原则：与 Heartbeat 保持一致，独立后台 Loop
-        let rescue_driver = self.clone();
-        tokio::spawn(async move {
-            rescue_driver.rescue_loop().await;
-        });
-
-        // 2. 启动拉取主循环 (阻塞直到 shutdown)
-        let fetcher_count = self.inner.ctx.config.worker.workers.max(1);
-        trace!("[Driver] Spawning {} fetch loops.", fetcher_count);
-        let mut join_set = tokio::task::JoinSet::new();
-        for _i in 0..fetcher_count {
-            let driver_clone = self.clone();
-            join_set.spawn(async move {
-                driver_clone.fetch_loop().await;
-            });
-        }
-        // 3. 等待所有拉取协程退出
-        while let Some(_) = join_set.join_next().await {}
-
-        // 4. 等待正在运行的任务完成
-        let mut check_interval = tokio::time::interval(Duration::from_millis(100));
-        while !self.inner.running_tasks.is_empty() {
-            check_interval.tick().await;
-        }
+        info!("Starting Talos Driver...");
+        // 1. 启动后台维护任务
+        self.spawn_background();
+        // 2. 启动消费者 (阻塞直到 Shutdown)
+        self.run_consumers().await;
+        info!("Initiating graceful shutdown sequence");
+        // 3. 优雅停机
+        self.graceful_shutdown_sequence().await;
         // [Hook] 关闭
-        for p in self.inner.plugins.iter() {
-            p.on_shutdown(&self.inner.ctx).await;
+        for p in self.state.plugins.iter() {
+            p.on_shutdown(&self.state.ctx).await;
         }
-        trace!("[Driver-{}] Shutdown complete.", self.inner.ctx.node_id);
+        info!("Driver shutdown complete");
     }
 
-    /// 任务拉取主循环
-    ///
-    /// 职责：
-    /// 1. 监听起搏器 (Pacemaker) 的信号，决定何时尝试拉取任务。
-    /// 2. 执行插件的前置检查 (before_fetch)。
-    /// 3. 申请并发许可 (Semaphore)。
-    /// 4. 从持久化层批量拉取任务 (Acquire)。
-    /// 5. 异步分发任务 (Spawn)。
-    async fn fetch_loop(&self) {
-        // 创建起搏器 (Pacemaker)，传入必要的共享状态和策略
-        let mut pacemaker = TaskPacemaker::new(
-            &self.inner.paused,
-            &self.inner.notify,
-            &self.inner.ctx.shutdown,
-            self.inner.wait_strategy.clone(),
-        );
-        let semaphore = &self.inner.semaphore;
-        let batch_size_cfg = self.inner.ctx.config.cluster.acquire_batch_size;
-        loop {
-            // 等待信号 (Wait)
-            match pacemaker.wait_next().await {
-                PacemakerEvent::Trigger => {}
-                PacemakerEvent::Shutdown => break,
-                PacemakerEvent::Idle => continue,
-                PacemakerEvent::Reload => {
-                    // 目前没有动态配置的设计，但如果未来有了，这里可以处理配置重载逻辑。
-                }
-            }
-            // 插件流控
-            let mut allow_fetch = true;
-            for plugin in self.inner.plugins.iter() {
-                if !plugin.before_fetch(&self.inner.ctx).await {
-                    allow_fetch = false;
-                    break;
-                }
-            }
-            if !allow_fetch {
-                pacemaker.mark_idle();
-                continue;
-            }
-            // =========================================================
-            // 并发控制
-            // =========================================================
-
-            // 检查余量
-            let available = self.inner.semaphore.available_permits();
-            // 如果当前完全没空位，不要忙轮询，而是挂起等待至少 1 个空位释放。
-            if available == 0 {
-                match tokio::time::timeout(Duration::from_secs(1), self.inner.semaphore.acquire())
-                    .await
-                {
-                    Ok(Ok(permit)) => {
-                        // 等到了空位！立即释放
-                        drop(permit);
-                    }
-                    _ => {
-                        // 等了 1秒 还没空位，或者获取失败
-                        // 标记为 idle，让 pacemaker 增加退避，减少检测频率
-                        pacemaker.mark_idle();
-                    }
-                }
-                continue;
-            }
-
-            // 计算本次最大能拉多少 (不超过 Batch，也不超过 Available)
-            // 注意：再次获取 available，因为刚才可能变了
-            let current_available = semaphore.available_permits();
-            // 防止 acquire_many 报错（不能申请 0 个）
-            if current_available == 0 {
-                pacemaker.mark_idle();
-                continue;
-            }
-            let ask_size = batch_size_cfg.min(current_available);
-
-            // 批量占座 (Bulk Acquire)
-            // 一次原子操作拿走所有需要的票。
-            let bulk_permit = match semaphore.clone().acquire_many_owned(ask_size as u32).await {
-                Ok(p) => p,
-                Err(_) => break, // 信号量被关闭
-            };
-            // =========================================================
-            // 执行拉取 (Fetch)
-            // =========================================================
-
-            // 调用持久化层 (Queue) 拉取任务
-            match self
-                .inner
-                .ctx
-                .queue
-                .acquire(&self.inner.ctx.node_id, ask_size, 3)
-                .await
-            {
-                Ok(items) => {
-                    let fetched_count = items.len();
-
-                    // 没有拉到任务，可能是暂时没有到期的任务了，或者竞争太激烈了。
-                    if fetched_count == 0 {
-                        pacemaker.mark_idle();
-                        continue;
-                    }
-                    // 拉到了任务 -> 标记忙碌 (重置退避时间为 0)
-                    pacemaker.mark_busy();
-                    // 禁止自动释放许可，因为我们要把它们分发给具体的任务了。
-                    bulk_permit.forget();
-
-                    // 实际拿到的任务数量可能少于 ask_size，释放多余的许可
-                    if fetched_count < ask_size {
-                        semaphore.add_permits(ask_size - fetched_count);
-                    }
-
-                    // 任务分发 (Spawn)
-                    for item in items {
-                        let guard = PermitGuard {
-                            semaphore: semaphore.clone(),
-                            permits: 1,
-                        };
-                        self.spawn_task(item, guard).await;
-                    }
-                }
-                Err(e) => {
-                    error!("[Driver] Acquire failed: {:?}", e);
-                    // 遇到错误必须退避，防止错误风暴
-                    pacemaker.mark_idle();
-                    // bulk_permit 自动 Drop，全额退票 -> 正确
-
-                    // 保护性休眠
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        }
-    }
-
-    /// 任务分发
-    async fn spawn_task(&self, item: AcquireItem, permit: PermitGuard) {
-        let driver = self.clone();
-
-        let token = CancellationToken::new();
-        driver.inner.running_tasks.insert(
-            item.id.clone(),
-            RunningTaskHandle {
-                epoch: item.score,
-                token: token.clone(),
-            },
-        );
-        tokio::spawn(async move {
-            // 所有权转移：PermitGuard 移动到了这个 Future 内部。
-            // 无论 execute_task 是成功、失败还是 Panic，
-            // 只要这个 async 块结束，permit 就会被 Drop，从而归还信号量。
-            let _guard = permit;
-            driver.execute_task(item.id, item.score, token).await;
-        });
-    }
-
-    // ==========================================
-    // Core Logic: 执行逻辑
-    // ==========================================
-
-    /// 执行任务
-    async fn execute_task(&self, task_id: String, epoch: u64, token: CancellationToken) {
-        let store = &self.inner.ctx.store;
-        let mut task_data = match store.load(&task_id).await {
-            // 1. 正常路径
-            Ok(LoadStatus::Found(c)) => c,
-            // 2.  数据损坏
-            Ok(LoadStatus::DataCorrupted {
-                reason: _,
-                raw_content: _,
-            }) => {
-                // 必须彻底删除该任务，否则 Rescuer 会无限复活它
-                store.remove(&task_id).await.ok();
-                self.inner.running_tasks.remove(&task_id);
-                return;
-            }
-            // 3. 幽灵路径 (Orphan): 索引还在，数据没了
-            Ok(LoadStatus::NotFound) => {
-                // 彻底清理
-                let _ = store.remove(&task_id).await;
-                self.inner.running_tasks.remove(&task_id);
-                return;
-            }
-            // 4. 系统故障: Redis 连不上等
-            Err(e) => {
-                error!("[Driver] Load task {} failed: {:?}", task_id, e);
-                self.inner.running_tasks.remove(&task_id);
-                return;
-            }
-        };
-        let runtime_ctx = TaskContext::new(
-            task_data.clone(),
-            token.clone(),
-            self.inner.extensions.clone(),
-        );
-
-        task_data.mark_running(self.inner.ctx.node_id.clone(), epoch);
-        // Hook: 执行前
-        for p in self.inner.plugins.iter() {
-            p.before_execute(&runtime_ctx).await;
-        }
-        let start_time = TimeUtils::now();
-        let result = AssertUnwindSafe(self.inner.task_handler.execute(runtime_ctx.clone()))
-            .catch_unwind()
-            .await;
-        let duration = TimeUtils::now() - start_time;
-        // [Hook] 执行后 (通用)
-        // 无论成功失败，先记录耗时
-        for p in self.inner.plugins.iter() {
-            p.after_execute(&runtime_ctx, duration).await;
-        }
-        // 处理执行结果
-        match result {
-            Ok(execution_result) => match execution_result {
-                Ok(_) => {
-                    // [Hook] 成功钩子
-                    for p in self.inner.plugins.iter() {
-                        p.on_success(&runtime_ctx).await;
-                    }
-                    self.handle_success(task_data).await
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    // [Hook] 失败钩子
-                    for p in self.inner.plugins.iter() {
-                        p.on_failure(&runtime_ctx, &err_msg).await;
-                    }
-                    self.handle_failure(task_data, err_msg).await
-                }
-            },
-            Err(panic_err) => {
-                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
-                    format!("Panic: {}", s)
-                } else if let Some(s) = panic_err.downcast_ref::<String>() {
-                    format!("Panic: {}", s)
-                } else {
-                    "Panic: Unknown error".to_string()
-                };
-                error!("[Driver] Task {} panicked: {}", task_id, msg);
-                // [Hook] 失败钩子
-                for p in self.inner.plugins.iter() {
-                    p.on_failure(&runtime_ctx, &msg).await;
-                }
-                self.handle_failure(task_data, msg).await;
-            }
-        }
-        self.inner.running_tasks.remove(&task_id);
-    }
-
-    /// 处理任务失败
-    /// - 释放锁
-    /// - 计算退避时间
-    /// - 重入队或进入 DLQ
-    async fn handle_failure(&self, mut task: TaskData<T>, err_msg: String) {
-        let store = &self.inner.ctx.store;
-        let queue = &self.inner.ctx.queue;
-
-        // 释放队列锁
-        let _ = queue
-            .release(&[task.id.clone()], &self.inner.ctx.node_id)
-            .await;
-        if task.can_retry() {
-            // === 可重试 ===
-            task.last_error = Some(err_msg);
-
-            // 使用带抖动的指数退避算法
-            // 参数配置可以从 self.inner.ctx.config 中读取，这里先写死默认值：
-            // - Base: 1秒
-            // - Max: 1小时 (3600秒)
-            let backoff_duration = calculate_backoff(
-                task.attempt,
-                1.0,    // Base Delay
-                3600.0, // Max Delay
-            );
-
-            let now = TimeUtils::now();
-
-            // 下次拉取时间 = 现在 + 退避时长
-            task.next_poll_at = now + backoff_duration.as_secs_f64();
-
-            // 重置状态以便下次被拉取
-            task.state = TaskState::Pending;
-            task.epoch = 0;
-            task.worker_id = None;
-            task.updated_at = now;
-            // 重新入队
-            if let Err(e) = store.requeue(task.clone()).await {
-                error!("[Driver] Retry requeue failed for {}: {:?}", task.id, e);
-            }
-        } else {
-            // === 重试耗尽 (Exhausted) ===
-            if let Err(e) = store.move_to_dlq(&task, err_msg).await {
-                error!("[Driver] Move to DLQ failed for {}: {:?}", task.id, e);
-            }
-        }
-    }
-    /// 运行成功
-    async fn handle_success(&self, mut task: TaskData<T>) {
-        let store = &self.inner.ctx.store;
-        let queue = &self.inner.ctx.queue;
-        // 释放运行锁
-        let _ = queue
-            .release(&[task.id.clone()], &self.inner.ctx.node_id)
-            .await;
-        let now = TimeUtils::now_f64();
-        // 计算下次运行时间
-        let next_time = TimeUtils::next_recurrence_time(
-            &task.schedule_type,
-            task.timezone.as_deref(), // 获取 Option<&str>
-            now,
-        );
-        if let Some(ts) = next_time {
-            task.next_poll_at = ts;
-            task.state = TaskState::Pending;
-            task.epoch = 0;
-            task.worker_id = None;
-            task.updated_at = now;
-            // 重新入队
-            if let Err(e) = store.requeue(task).await {
-                error!("Requeue failed: {:?}", e);
-            }
-        } else {
-            // === 是一次性任务，或 Cron 结束 ===
-            if let Err(e) = store.remove(&task.id).await {
-                error!("Remove failed: {:?}", e);
-            }
-        }
-    }
-    /// 心跳包循环
-    async fn heartbeat_loop(&self) {
-        // 配置系统间隔时间
-        let interval = Duration::from_millis(self.inner.ctx.config.cluster.heartbeat_interval_ms);
-
-        loop {
-            sleep(interval).await;
-            if self.inner.ctx.is_shutdown() {
-                break;
-            }
-
-            // 1. 获取快照
-            let tasks: Vec<(String, u64)> = self
-                .inner
-                .running_tasks
-                .iter()
-                .map(|entry| (entry.key().clone(), entry.value().epoch))
-                .collect();
-
-            if tasks.is_empty() {
-                continue;
-            }
-            const BATCH_SIZE: usize = 100;
-            for batch in tasks.chunks(BATCH_SIZE) {
-                // 2. 发送心跳
-                match self
-                    .inner
-                    .ctx
-                    .queue
-                    .heartbeat(&batch, &self.inner.ctx.node_id)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(SchedulerError::FencingTokenMismatch {
-                        task_id,
-                        expected: _,
-                        actual: _,
-                    }) => {
-                        // 处理脑裂 (Fencing)
-                        error!(
-                            "[Driver] Split Brain detected! Task {} lost ownership. Cancelling...",
-                            task_id
-                        );
-                        // 立即处决本地任务
-                        self.cancel_task(&task_id);
-                    }
-                    Err(e) => {
-                        trace!("[Driver] Heartbeat failed: {:?}", e);
-                        // 可选：防止日志刷屏
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        }
-    }
-    /// 僵尸任务回收循环
-    async fn rescue_loop(&self) {
-        let config = &self.inner.ctx.config.policy;
-        let interval = Duration::from_millis(config.zombie_check_interval_ms);
-
-        if config.zombie_check_interval_ms == 0 {
-            return;
-        }
-
-        loop {
-            sleep(interval).await;
-            if self.inner.ctx.is_shutdown() {
-                break;
-            }
-
-            // 获取统一时间
-            let now = TimeUtils::now();
-            let timeout_ms = config.zombie_check_interval_ms; // 或者 visibility_timeout_ms
-            let batch_size = config.rescue_batch_size;
-
-            // 调用 rescue，传入 timeout 原始值，让底层决定怎么算
-            match self
-                .inner
-                .ctx
-                .queue
-                .rescue(&self.inner.ctx.node_id, now, timeout_ms, batch_size)
-                .await
-            {
-                Ok(ids) => {
-                    if !ids.is_empty() {
-                        // log...
-                    }
-                }
-                Err(e) => error!("Rescue failed: {:?}", e),
-            }
-        }
-    }
-}
-
-impl<Task, T> TaskDriver<Task, T>
-where
-    Task: crate::common::traits::SchedulableTask<T> + Send + Sync + 'static,
-    T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned + 'static,
-{
+    /// 手动取消单个任务 (API 支持)
     pub fn cancel_task(&self, task_id: &str) -> bool {
-        if let Some(handle) = self.inner.running_tasks.get(task_id) {
-            handle.token.cancel(); // 触发级联取消
-            trace!("[Driver] Cancel signal sent to task {}", task_id);
+        if let Some(handle) = self.state.registry.get(task_id) {
+            handle.token.cancel();
+            info!("[Driver] Manually cancelled task {}", task_id);
             return true;
         }
         false
     }
 
-    pub fn cancel_all_running(&self) -> usize {
-        let mut count = 0;
-        // 同样，这里也不要 remove，只是触发 cancel
-        for entry in self.inner.running_tasks.iter() {
-            entry.value().token.cancel();
-            count += 1;
-        }
-        trace!("[Driver] Broadcast cancel to {} tasks.", count);
-        count
-    }
-    /// 触发优雅停机
-    /// - 所有组件通过 CancellationToken 收到通知
+    /// 触发停机
     pub fn shutdown(&self) {
-        trace!("[Driver] Shutdown triggered.");
-        self.inner.ctx.shutdown.cancel();
+        info!("[Driver] Shutdown triggered manually.");
+        self.state.ctx.shutdown.cancel();
+    }
+
+    // --- Private Helpers ---
+
+    fn spawn_background(&self) {
+        let m1 = self.maintainer.clone();
+        tokio::spawn(async move {
+            m1.start_heartbeat().await;
+        });
+
+        let m2 = self.maintainer.clone();
+        tokio::spawn(async move {
+            m2.start_rescue().await;
+        });
+    }
+
+    async fn run_consumers(&self) {
+        let workers = self.state.ctx.config.worker.workers.max(1);
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for i in 0..workers {
+            let consumer = self.consumer.clone();
+            join_set.spawn(async move {
+                trace!("[Driver] Starting Consumer-{}", i);
+                consumer.run_loop().await;
+            });
+        }
+        while let Some(_) = join_set.join_next().await {}
+        trace!("[Driver] All consumers stopped.");
+    }
+    #[instrument(skip(self))]
+    async fn graceful_shutdown_sequence(&self) {
+        let count = self.state.registry.len();
+        if count == 0 {
+            return;
+        }
+
+        let timeout_sec = self.state.ctx.config.policy.shutdown_timeout_secs.max(1);
+        let max_concurrency = self.state.ctx.config.worker.max_concurrency as u32;
+
+        info!(
+            "[Driver] Waiting for {} tasks... (Timeout: {}s)",
+            count, timeout_sec
+        );
+
+        // 优化：利用 Semaphore 特性等待，而不是轮询
+        let wait_drain = self.state.semaphore.acquire_many(max_concurrency);
+        match tokio::time::timeout(Duration::from_secs(timeout_sec), wait_drain).await {
+            Ok(_) => info!("[Driver] Drained successfully."),
+            Err(_) => {
+                let remaining = self.state.registry.len();
+                error!(
+                    "[Driver] Shutdown Timeout! Force killing {} tasks.",
+                    remaining
+                );
+                self.force_cancel_all();
+            }
+        }
+    }
+
+    /// 强制取消所有任务
+    pub fn force_cancel_all(&self) {
+        let mut count = 0;
+        for entry in self.state.registry.iter() {
+            if !entry.value().token.is_cancelled() {
+                entry.value().token.cancel();
+                count += 1;
+            }
+        }
+        info!("[Driver] Broadcast cancel signal to {} tasks.", count);
     }
 }
